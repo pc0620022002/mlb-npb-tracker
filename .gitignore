@@ -1,0 +1,28 @@
+# 狀態檔(每台機器不同,不進版控)
+state.json
+
+# 歸檔資料夾
+_archived/
+
+# Claude Code 本機設定
+.claude/
+
+# 本機筆記(依全域 CLAUDE.md 規則)
+PROJECT_CONTEXT.md
+CODE_REVIEW.md
+NOTES.md
+TODO.md
+
+# Python 快取
+__pycache__/
+*.pyc
+
+# Log
+launchd.log
+cron.log
+
+# 環境變數
+.env
+
+# macOS
+.DS_Store

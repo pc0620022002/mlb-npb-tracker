@@ -1,0 +1,37 @@
+name: Baseball Notifier # v4
+
+on:
+  schedule:
+    # Every 1 minute - script has smart frequency:
+    # 1min when tracked players have games, 10min otherwise
+    - cron: '* * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: baseball-state-${{ github.run_id }}
+          restore-keys: |
+            baseball-state-
+
+      - name: Run notifier
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python baseball_notifier.py
