@@ -452,6 +452,19 @@ def _extract_npb_batting(html, search_patterns):
             # else: all stats are zero → player listed in lineup but hasn't batted yet
     return ""
 
+def _extract_npb_rbi_total(html, search_patterns):
+    """從打擊 row 取出該打者的總打點數,用來推算每打席打點分配。"""
+    for pattern in search_patterns:
+        escaped = re.escape(pattern)
+        bat_re = escaped + r'</a>\s*</td>\s*<td[^>]*>([.\d-]+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>'
+        m = re.search(bat_re, html, re.DOTALL)
+        if m:
+            try:
+                return int(m.group(5))
+            except (ValueError, IndexError):
+                return 0
+    return 0
+
 def _extract_npb_pitching(html, search_patterns):
     """Extract pitching stats for a player from Yahoo Japan stats HTML.
     Columns after name: 防御率 投球回 投球数 打者 被安打 被本塁打 奪三振 与四球 与死球 ボーク 失点 自責点
@@ -477,7 +490,8 @@ def _extract_npb_at_bats(html, search_patterns):
     may contain <div class="bb-statsTable__dataDetail">result</div> text like:
         右安 (right single), 左2 (left double), 中本 (center HR),
         空三振 (swinging K), 見三振 (called K), 四球, 投ゴロ, ... etc.
-    Returns a list of non-empty result strings in order.
+    打點打席會額外加上 class bb-statsTable__dataDetail--point。
+    Returns a list of (result_str, has_point: bool) tuples in order.
     """
     for pattern in search_patterns:
         idx = html.find(pattern)
@@ -492,9 +506,11 @@ def _extract_npb_at_bats(html, search_patterns):
         inning_cells = tds[-9:] if len(tds) >= 21 else tds[12:]
         results = []
         for cell in inning_cells:
-            m = re.search(r'<div class="bb-statsTable__dataDetail[^"]*">([^<]+)</div>', cell)
+            m = re.search(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell)
             if m:
-                results.append(m.group(1).strip())
+                classes, text = m.group(1), m.group(2).strip()
+                has_point = "--point" in classes
+                results.append((text, has_point))
         if results:
             return results
     return []
@@ -625,8 +641,23 @@ def _check_npb_league(state, league, league_label):
                 if bat_stats:
                     ab_results = _extract_npb_at_bats(stats_html, pinfo["search"])
                     if ab_results:
-                        ab_lines = "\n".join(f"  {i+1}. {ev}" for i, ev in enumerate(ab_results))
-                        full_stat = f"{stat_line}\n\U0001f4dd 每打席：\n{ab_lines}"
+                        # Yahoo Japan 只在 cell 標 boolean「該打席有打點」,沒提供具體數字。
+                        # 用「總 RBI + 有打點打席數」推算每打席打點數。
+                        rbi_total = _extract_npb_rbi_total(stats_html, pinfo["search"])
+                        point_count = sum(1 for _, has_pt in ab_results if has_pt)
+                        ab_lines = []
+                        for i, (ev, has_pt) in enumerate(ab_results):
+                            if has_pt and rbi_total > 0:
+                                if point_count == 1:
+                                    suffix = f" ({rbi_total}打點)"
+                                elif point_count == rbi_total:
+                                    suffix = " (1打點)"
+                                else:
+                                    suffix = " (有打點)"
+                            else:
+                                suffix = ""
+                            ab_lines.append(f"  {i+1}. {ev}{suffix}")
+                        full_stat = f"{stat_line}\n\U0001f4dd 每打席：\n" + "\n".join(ab_lines)
 
                 if not is_finished:
                     # --- MID-GAME: live update whenever stat line changes ---
