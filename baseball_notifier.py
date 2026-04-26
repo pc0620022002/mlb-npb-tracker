@@ -8,39 +8,45 @@ from datetime import datetime, date, timedelta, timezone
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-# (name, player_id, mlb_org_team_id)
+# (name, player_id, mlb_org_team_id, origin)
+# origin: "jp"=日本 / "kr"=韓國 / "tw"=台灣 / "us"=美國(自選 MLB 球星)
+# 3A 推播規則:只有 origin 在 AAA_PUSH_ORIGINS 集合內的球員會在 3A 比賽被推播;
+#   其他國籍球員(jp/kr/us)只推播 MLB,但若日後升上 MLB,MLB 段會自動覆蓋到。
 # MLB org IDs: 108=LAA, 109=ARI, 111=BOS, 112=CHC, 114=CLE, 115=COL,
 #   116=DET, 117=HOU, 119=LAD, 120=WSH, 121=NYM, 134=PIT,
 #   135=SD, 137=SF, 141=TOR, 144=ATL, 145=CHW
 MLB_PLAYERS = [
-    ("Shohei Ohtani", 660271, 119),       # Dodgers
-    ("Yoshinobu Yamamoto", 808967, 119),   # Dodgers
-    ("Roki Sasaki", None, 119),            # Dodgers
-    ("Yu Darvish", 506433, 135),           # Padres
-    ("Yuki Matsui", None, 135),            # Padres
-    ("Yusei Kikuchi", 579328, 108),        # Angels
-    ("Tatsuya Imai", 837227, 117),         # Astros
-    ("Seiya Suzuki", 673548, 112),         # Cubs
-    ("Shota Imanaga", None, 112),          # Cubs
-    ("Kodai Senga", None, 121),            # Mets
-    ("Masataka Yoshida", None, 111),       # Red Sox
-    ("Tomoyuki Sugano", None, 115),        # Rockies
-    ("Munetaka Murakami", 808959, 145),    # White Sox
-    ("Kazuma Okamoto", 672960, 141),       # Blue Jays
-    ("Shinnosuke Ogasawara", None, 120),   # Nationals
-    ("Jung Hoo Lee", 808982, 137),         # Giants
-    ("Ha-Seong Kim", 673490, 144),         # Braves
-    ("Hyeseong Kim", None, 119),           # Dodgers
-    ("Ji Hwan Bae", 678225, 121),          # Mets
-    ("Go Woo-Suk", None, 116),            # Tigers
-    ("Kai-Wei Teng", None, 117),           # Astros
-    ("Hao-Yu Lee", 701678, 116),           # Tigers
-    ("Po-Yu Chen", None, 134),             # Pirates
-    ("Yu-Min Lin", None, 109),             # Diamondbacks
-    ("Tsung-Che Cheng", None, 111),        # Red Sox
-    ("Jonathon Long", None, 112),          # Cubs
-    ("Stuart Fairchild", None, 114),       # Guardians
+    ("Shohei Ohtani", 660271, 119, "jp"),       # Dodgers
+    ("Yoshinobu Yamamoto", 808967, 119, "jp"),   # Dodgers
+    ("Roki Sasaki", None, 119, "jp"),            # Dodgers
+    ("Yu Darvish", 506433, 135, "jp"),           # Padres
+    ("Yuki Matsui", None, 135, "jp"),            # Padres
+    ("Yusei Kikuchi", 579328, 108, "jp"),        # Angels
+    ("Tatsuya Imai", 837227, 117, "jp"),         # Astros
+    ("Seiya Suzuki", 673548, 112, "jp"),         # Cubs
+    ("Shota Imanaga", None, 112, "jp"),          # Cubs
+    ("Kodai Senga", None, 121, "jp"),            # Mets
+    ("Masataka Yoshida", None, 111, "jp"),       # Red Sox
+    ("Tomoyuki Sugano", None, 115, "jp"),        # Rockies
+    ("Munetaka Murakami", 808959, 145, "jp"),    # White Sox
+    ("Kazuma Okamoto", 672960, 141, "jp"),       # Blue Jays
+    ("Shinnosuke Ogasawara", None, 120, "jp"),   # Nationals
+    ("Jung Hoo Lee", 808982, 137, "kr"),         # Giants
+    ("Ha-Seong Kim", 673490, 144, "kr"),         # Braves
+    ("Hyeseong Kim", None, 119, "kr"),           # Dodgers
+    ("Ji Hwan Bae", 678225, 121, "kr"),          # Mets
+    ("Go Woo-Suk", None, 116, "kr"),             # Tigers
+    ("Kai-Wei Teng", None, 117, "tw"),           # Astros
+    ("Hao-Yu Lee", 701678, 116, "tw"),           # Tigers
+    ("Po-Yu Chen", None, 134, "tw"),             # Pirates
+    ("Yu-Min Lin", None, 109, "tw"),             # Diamondbacks
+    ("Tsung-Che Cheng", None, 111, "tw"),        # Red Sox
+    ("Jonathon Long", None, 112, "us"),          # Cubs
+    ("Stuart Fairchild", None, 114, "us"),       # Guardians
 ]
+
+# 哪些 origin 的球員在 3A 比賽要推播。其他國籍只推播 MLB。
+AAA_PUSH_ORIGINS = {"tw"}
 
 # NPB Taiwanese players: Chinese name -> {search patterns on Yahoo Japan, team info}
 # Names appear as kanji with space on Yahoo Japan stats pages (e.g. "林 安可")
@@ -252,7 +258,9 @@ def _fmt_batter_stats(bat, season_avg=None):
         line += f" (打率{season_avg})"
     return line
 
-def check_schedule(sport_id, prefix, label, state):
+def check_schedule(sport_id, prefix, label, state, players=None):
+    if players is None:
+        players = MLB_PLAYERS
     notifs = []
     today = date.today()
     yesterday = today - timedelta(days=1)
@@ -285,7 +293,7 @@ def check_schedule(sport_id, prefix, label, state):
             for side in ["homePlayers","awayPlayers"]:
                 for pl in lineups.get(side,[]):
                     pid = pl.get("id"); fn = pl.get("fullName","")
-                    m = is_match(pid, fn, MLB_PLAYERS)
+                    m = is_match(pid, fn, players)
                     if m:
                         k = f"{prefix}_{game_date_str}_lineup_{gp}_{pid}"
                         if k not in state:
@@ -296,7 +304,7 @@ def check_schedule(sport_id, prefix, label, state):
                 p = g.get("teams",{}).get(side,{}).get("probablePitcher",{})
                 pid = p.get("id"); fn = p.get("fullName","")
                 if pid:
-                    m = is_match(pid, fn, MLB_PLAYERS)
+                    m = is_match(pid, fn, players)
                     if m:
                         k = f"{prefix}_{game_date_str}_pitcher_{gp}_{pid}"
                         if k not in state:
@@ -312,7 +320,7 @@ def check_schedule(sport_id, prefix, label, state):
                         for pk, pv in pls.items():
                             pid_str = pk.replace("ID","")
                             fn = pv.get("person",{}).get("fullName","")
-                            m = is_match(pid_str, fn, MLB_PLAYERS)
+                            m = is_match(pid_str, fn, players)
                             if m:
                                 stats = pv.get("stats",{})
                                 bat = stats.get("batting",{}); pit = stats.get("pitching",{})
@@ -717,7 +725,9 @@ def _tracked_teams_have_games():
     """Check if any tracked player's TEAM has a game scheduled today.
     This ensures we detect substitute players who haven't appeared yet."""
     today_str = date.today().strftime("%Y-%m-%d")
-    tracked_mlb_orgs = set(org for _, _, org in MLB_PLAYERS)
+    tracked_mlb_orgs = set(p[2] for p in MLB_PLAYERS)
+    # 3A 只看會被推播的國籍(預設台灣);其他國籍球員的 3A 比賽不再列入追蹤
+    tracked_aaa_orgs = set(p[2] for p in MLB_PLAYERS if p[3] in AAA_PUSH_ORIGINS)
 
     # --- MLB (sportId=1): team IDs match org IDs directly ---
     try:
@@ -753,7 +763,7 @@ def _tracked_teams_have_games():
                     for side in ["home", "away"]:
                         tid = g.get("teams", {}).get(side, {}).get("team", {}).get("id")
                         parent = aaa_to_parent.get(tid)
-                        if parent and parent in tracked_mlb_orgs:
+                        if parent and parent in tracked_aaa_orgs:
                             log(f"AAA team playing today: ID {tid} (parent org {parent})")
                             return True
     except Exception as e:
@@ -830,7 +840,8 @@ def main():
 
     log("Checking Triple-A...")
     n = len(all_notifs)
-    all_notifs += check_schedule(11, "aaa", "AAA 3A", state)
+    aaa_players = [p for p in MLB_PLAYERS if p[3] in AAA_PUSH_ORIGINS]
+    all_notifs += check_schedule(11, "aaa", "AAA 3A", state, players=aaa_players)
     log(f"  -> {len(all_notifs)-n} 3A notifications")
 
     log("Checking NPB 1軍...")
