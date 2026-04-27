@@ -460,11 +460,13 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                     log(f"Boxscore err {gp}: {e}")
     return notifs
 
-def _fetch_yahoo(url):
-    """Fetch Yahoo Japan page with proper headers"""
+def _fetch_yahoo(url, timeout=8):
+    """Fetch Yahoo Japan page with proper headers.
+    timeout 預設 8 秒(2026-04-28 從 15 秒降下,避免 schedule 頁列出的未來一週 game 一個個 fetch
+    時遇到 Yahoo Japan 慢就累積拖垮整個 main()。配合 NPB_BUDGET_SECONDS 用)。"""
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=timeout)
         if r.status_code == 200:
             return r.text
     except Exception as e:
@@ -587,6 +589,11 @@ def _extract_npb_lineup(html, search_patterns):
 def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
+    # NPB 段最多花 90 秒(2026-04-28 加,避免 Yahoo Japan 半夜慢時拖垮整個 main)。
+    # schedule 頁面會列出未來一週的 game,每個 game 都要 fetch /top 才知道日期,
+    # 34 場 × 8s timeout 最壞 270s,所以這裡用 budget bail 而非 timeout 累積。
+    NPB_BUDGET_SECONDS = 90
+    npb_start_ts = datetime.now(timezone.utc).timestamp()
     # Use JST (UTC+9) for Japan date
     jst = timezone(timedelta(hours=9))
     now_jst = datetime.now(jst)
@@ -616,8 +623,16 @@ def _check_npb_league(state, league, league_label):
     games_today = 0
     games_with_lineup_checked = 0
     players_found_total = 0
+    bailed_due_to_budget = False
 
     for game_id in game_ids:
+        # 預算保護:NPB 段最多花 NPB_BUDGET_SECONDS 秒,超過就停止處理剩下的 game,
+        # 讓 MLB / 3A 段已經做完的推播能正常 save_state,且不會撞到 main 的 240s SIGALRM
+        elapsed_npb = datetime.now(timezone.utc).timestamp() - npb_start_ts
+        if elapsed_npb > NPB_BUDGET_SECONDS:
+            log(f"NPB {league_label}: budget {NPB_BUDGET_SECONDS}s exceeded after {games_today} today/{len(game_ids)} total games — bailing rest")
+            bailed_due_to_budget = True
+            break
         # Fetch /top page for reliable game status (score/finished/lineup)
         top_url = f"https://baseball.yahoo.co.jp/npb/game/{game_id}/top"
         top_html = _fetch_yahoo(top_url)
@@ -746,7 +761,9 @@ def _check_npb_league(state, league, league_label):
                     else:
                         log(f"    SKIP (lineup key exists): {lineup_key}")
 
-    log(f"NPB {league_label} summary: {games_with_stats} with stats, {games_today} today, {games_with_lineup_checked} checked for lineup, {players_found_total} player appearances")
+    npb_total_secs = int(datetime.now(timezone.utc).timestamp() - npb_start_ts)
+    bail_note = " [⚠️ BAILED ON BUDGET]" if bailed_due_to_budget else ""
+    log(f"NPB {league_label} summary: {games_with_stats} with stats, {games_today} today, {games_with_lineup_checked} checked for lineup, {players_found_total} player appearances, {npb_total_secs}s elapsed{bail_note}")
 
     return notifs
 
