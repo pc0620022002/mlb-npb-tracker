@@ -49,6 +49,13 @@ MLB_PLAYERS = [
 # 哪些 origin 的球員在 3A 比賽要推播。其他國籍只推播 MLB。
 AAA_PUSH_ORIGINS = {"tw"}
 
+# 自動偵測排除名單:即使 birthCountry 符合 jp/kr/tw,也不要納入動態追蹤。
+# 用途:有些日裔/韓裔球員是在亞洲出生但生涯都在美國,跟使用者關心的「旅美亞洲球員」概念不同。
+# 這個 set 只影響 discover_asian_players(),不影響 hardcoded MLB_PLAYERS。
+EXCLUDE_FROM_DISCOVERY = {
+    608701,  # Rob Refsnyder(韓裔 MLB,在韓國出生但生涯都在美國體系,使用者不追)
+}
+
 # NPB Taiwanese players: Chinese name -> {search patterns on Yahoo Japan, team info}
 # Names appear as kanji with space on Yahoo Japan stats pages (e.g. "林 安可")
 NPB_PLAYERS_INFO = {
@@ -782,6 +789,8 @@ def discover_asian_players(state):
                 pid = p.get("id")
                 if not pid or pid in hardcoded_pids:
                     continue
+                if pid in EXCLUDE_FROM_DISCOVERY:
+                    continue  # 永久排除名單
                 if _norm_name(p.get("fullName", "")) in hardcoded_names:
                     continue  # hardcoded 用 fuzzy name 比對的(pid 為 None),也擋掉
                 pid_str = str(pid)
