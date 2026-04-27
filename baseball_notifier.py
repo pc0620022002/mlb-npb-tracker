@@ -36,6 +36,7 @@ MLB_PLAYERS = [
     ("Hyeseong Kim", None, 119, "kr"),           # Dodgers
     ("Ji Hwan Bae", 678225, 121, "kr"),          # Mets
     ("Go Woo-Suk", None, 116, "kr"),             # Tigers
+    ("Sung-Mun Song", 823550, 135, "kr"),        # Padres
     ("Kai-Wei Teng", None, 117, "tw"),           # Astros
     ("Hao-Yu Lee", 701678, 116, "tw"),           # Tigers
     ("Po-Yu Chen", None, 134, "tw"),             # Pirates
