@@ -2,8 +2,19 @@
 # -*- coding: utf-8 -*-
 """Baseball Player Notification Bot - MLB / 3A / NPB"""
 
-import re, requests, json, os, sys
+import re, requests, json, os, sys, signal
 from datetime import datetime, date, timedelta, timezone
+
+# 單次 main() 執行最大時間(秒)。launchd 每 5 分鐘觸發一次,
+# 設 240s(4 分鐘)留 60 秒緩衝給下一次正常排程。
+# 超時會強制 sys.exit(1),已 dedup 的 push 不會丟(寫入 state 是逐筆 append,
+# 但因為 main 結尾才 save_state,timeout 會丟掉本次未 save 的 dedup key →
+# 下次 run 可能重發某些通知,但比起 launchd 排程卡死整晚是更小的代價)。
+MAX_RUNTIME_SECONDS = 240
+
+def _abort_on_timeout(signum, frame):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ main() exceeded {MAX_RUNTIME_SECONDS}s, aborting to keep launchd schedule alive")
+    sys.exit(1)
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -907,6 +918,9 @@ def main():
     log("=" * 40)
     log("Baseball Notifier start")
     log(f"State file: {STATE_FILE}")
+    # 設定整個 main() 最大執行時間,避免 NPB Yahoo Japan timeout 累積拖垮 launchd 排程
+    signal.signal(signal.SIGALRM, _abort_on_timeout)
+    signal.alarm(MAX_RUNTIME_SECONDS)
     state = load_state()
 
     # One-time cleanup: clear stale NPB keys from old broken detection logic.
@@ -977,6 +991,7 @@ def main():
             log("Send failed")
 
     save_state(state)
+    signal.alarm(0)  # 正常結束前關掉 timeout
     log(f"Done! Sent {sent}/{len(all_notifs)} notifications")
     log("=" * 40)
 
