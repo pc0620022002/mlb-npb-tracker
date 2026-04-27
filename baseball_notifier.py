@@ -121,6 +121,16 @@ def to_tw(iso):
     except Exception:
         return iso
 
+def _day_prefix(iso):
+    # 依台灣時間判斷比賽是今天還是明天(以後),用來決定文字寫「今日」還是「明日」
+    if not iso: return "今日"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z","+00:00")).astimezone(TW)
+        delta_days = (dt.date() - datetime.now(TW).date()).days
+        return "明日" if delta_days >= 1 else "今日"
+    except Exception:
+        return "今日"
+
 def is_match(pid, fname, players):
     # Normalize whitespace (MLB API sometimes returns double spaces e.g. "Hao-Yu  Lee")
     fn = re.sub(r"\s+", " ", (fname or "").lower()).strip()
@@ -308,7 +318,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                     if m:
                         k = f"{prefix}_{game_date_str}_pitcher_{gp}_{pid}"
                         if k not in state:
-                            notifs.append(f"\u26be <b>[{label} 預定先發投手]</b>\n\U0001f3df {matchup}\n\u26be <b>{m}</b> 今日預定先發！\n\U0001f554 {to_tw(gt)}")
+                            notifs.append(f"\u26be <b>[{label} 預定先發投手]</b>\n\U0001f3df {matchup}\n\u26be <b>{m}</b> {_day_prefix(gt)}預定先發！\n\U0001f554 {to_tw(gt)}")
                             state[k] = True
 
             # --- Mid-game appearance AND Final results (combined) ---
