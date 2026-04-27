@@ -732,13 +732,103 @@ def _check_npb_league(state, league, league_label):
 
     return notifs
 
-def _tracked_teams_have_games():
+# --- 自動偵測亞洲球員 ---
+# 規則:每天跑一次,掃 MLB(sport=1)所有 jp/kr/tw 球員 + 3A(sport=11)所有 tw 球員,
+# 自動加進 state["_dynamic_players"]。Hardcoded MLB_PLAYERS 同 pid 不會被覆蓋。
+_BIRTH_COUNTRY_TO_ORIGIN = {"Japan": "jp", "Republic of Korea": "kr", "Taiwan": "tw"}
+_DISCOVERY_BY_SPORT = {1: {"jp", "kr", "tw"}, 11: {"tw"}}
+_DISCOVERY_INTERVAL_SECONDS = 86400  # 24 小時
+
+def _norm_name(s):
+    """跟 is_match() 一樣的 normalize:小寫 + 多空白合併 + 前後 trim。"""
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+def discover_asian_players(state):
+    """每天首次執行時跑一次,把符合條件的球員加進 state['_dynamic_players']。
+    結構:{ pid_str: {"name": str, "org": int(MLB org id), "origin": "jp|kr|tw"}, ... }"""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if now_ts - state.get("_last_discovery_ts", 0) < _DISCOVERY_INTERVAL_SECONDS:
+        return
+    log("Running discovery scan for new Asian players...")
+    discovered = state.get("_dynamic_players", {})
+    # 用 pid 跟 normalize 過的名字兩條路擋,因為 hardcoded MLB_PLAYERS 的 pid 可能是 None(用 fuzzy name match)
+    hardcoded_pids = {p[1] for p in MLB_PLAYERS if p[1]}
+    hardcoded_names = {_norm_name(p[0]) for p in MLB_PLAYERS}
+    new_count = 0
+
+    # 預抓 AAA 隊伍 → 母 MLB org id 對照(3A 球員 currentTeam.id 是 3A 隊 id,要轉成母球團)
+    aaa_to_parent = {}
+    try:
+        rt = requests.get("https://statsapi.mlb.com/api/v1/teams",
+            params={"sportId": 11, "season": date.today().year}, timeout=10)
+        if rt.ok:
+            for t in rt.json().get("teams", []):
+                p = t.get("parentOrgId")
+                if p:
+                    aaa_to_parent[t["id"]] = p
+    except Exception as e:
+        log(f"discovery: AAA team mapping err: {e}")
+
+    for sport_id, allowed_origins in _DISCOVERY_BY_SPORT.items():
+        try:
+            r = requests.get(f"https://statsapi.mlb.com/api/v1/sports/{sport_id}/players",
+                params={"season": date.today().year}, timeout=20)
+            if not r.ok:
+                continue
+            for p in r.json().get("people", []):
+                origin = _BIRTH_COUNTRY_TO_ORIGIN.get(p.get("birthCountry", ""))
+                if not origin or origin not in allowed_origins:
+                    continue
+                pid = p.get("id")
+                if not pid or pid in hardcoded_pids:
+                    continue
+                if _norm_name(p.get("fullName", "")) in hardcoded_names:
+                    continue  # hardcoded 用 fuzzy name 比對的(pid 為 None),也擋掉
+                pid_str = str(pid)
+                if pid_str in discovered:
+                    continue  # 已 discover 過,不重複加(team 可能換,但 origin 不變)
+                team_id = p.get("currentTeam", {}).get("id")
+                org = aaa_to_parent.get(team_id, team_id) if sport_id == 11 else team_id
+                if not org:
+                    continue
+                discovered[pid_str] = {
+                    "name": p.get("fullName", ""),
+                    "org": org,
+                    "origin": origin,
+                }
+                new_count += 1
+                log(f"  discovered: {p.get('fullName')} (id={pid}, origin={origin}, org={org}, sport={sport_id})")
+        except Exception as e:
+            log(f"discovery err sport={sport_id}: {e}")
+
+    state["_dynamic_players"] = discovered
+    state["_last_discovery_ts"] = now_ts
+    log(f"discovery done. dynamic pool size: {len(discovered)} (added {new_count} new)")
+
+
+def get_all_tracked_players(state):
+    """合併 hardcoded MLB_PLAYERS + 動態名單。Hardcoded 優先(同 pid 不會重複)。"""
+    hardcoded_pids = {p[1] for p in MLB_PLAYERS if p[1]}
+    out = list(MLB_PLAYERS)
+    for pid_str, info in state.get("_dynamic_players", {}).items():
+        try:
+            pid = int(pid_str)
+        except (ValueError, TypeError):
+            continue
+        if pid in hardcoded_pids:
+            continue
+        out.append((info.get("name", ""), pid, info.get("org"), info.get("origin")))
+    return out
+
+
+def _tracked_teams_have_games(state):
     """Check if any tracked player's TEAM has a game scheduled today.
     This ensures we detect substitute players who haven't appeared yet."""
     today_str = date.today().strftime("%Y-%m-%d")
-    tracked_mlb_orgs = set(p[2] for p in MLB_PLAYERS)
+    all_players = get_all_tracked_players(state)
+    tracked_mlb_orgs = set(p[2] for p in all_players if p[2])
     # 3A 只看會被推播的國籍(預設台灣);其他國籍球員的 3A 比賽不再列入追蹤
-    tracked_aaa_orgs = set(p[2] for p in MLB_PLAYERS if p[3] in AAA_PUSH_ORIGINS)
+    tracked_aaa_orgs = set(p[2] for p in all_players if p[3] in AAA_PUSH_ORIGINS and p[2])
 
     # --- MLB (sportId=1): team IDs match org IDs directly ---
     try:
@@ -824,18 +914,23 @@ def main():
         if stale_keys:
             log(f"Cleared {len(stale_keys)} stale NPB state keys for {today_jst} (fix v3)")
 
+    # 自動偵測亞洲球員(每天跑一次,結果寫進 state["_dynamic_players"])
+    # 必須在 _tracked_teams_have_games 之前,因為動態名單會影響「今天哪些隊在打」的判斷
+    discover_asian_players(state)
+
     last_run = state.get("_last_run_ts", 0)
     now_ts = datetime.now(timezone.utc).timestamp()
     elapsed = now_ts - last_run
 
     # Dynamic frequency: 1min when tracked players' TEAMS have games, 10min otherwise
-    teams_playing = _tracked_teams_have_games()
+    teams_playing = _tracked_teams_have_games(state)
     if teams_playing:
         # Tracked teams have games today - run every time (1min with cron)
         log(f"Tracked team(s) playing today, running (elapsed: {int(elapsed)}s)")
     elif elapsed < 600:
         # No tracked team games - only check every 10 minutes
         log(f"No tracked team games today, last run {int(elapsed)}s ago, skipping (10min interval)")
+        save_state(state)  # 即使早返也要存,免得 discovery 結果丟失
         log("=" * 40)
         return
     else:
@@ -843,15 +938,19 @@ def main():
 
     state["_last_run_ts"] = now_ts
 
+    # 取合併名單(hardcoded MLB_PLAYERS + 動態 discovery 加的)
+    all_tracked = get_all_tracked_players(state)
+    log(f"Tracked player pool: {len(all_tracked)} ({len(MLB_PLAYERS)} hardcoded + {len(all_tracked) - len(MLB_PLAYERS)} dynamic)")
+
     all_notifs = []
 
     log("Checking MLB...")
-    all_notifs += check_schedule(1, "mlb", "MLB", state)
+    all_notifs += check_schedule(1, "mlb", "MLB", state, players=all_tracked)
     log(f"  -> {len(all_notifs)} MLB notifications")
 
     log("Checking Triple-A...")
     n = len(all_notifs)
-    aaa_players = [p for p in MLB_PLAYERS if p[3] in AAA_PUSH_ORIGINS]
+    aaa_players = [p for p in all_tracked if p[3] in AAA_PUSH_ORIGINS]
     all_notifs += check_schedule(11, "aaa", "AAA 3A", state, players=aaa_players)
     log(f"  -> {len(all_notifs)-n} 3A notifications")
 
