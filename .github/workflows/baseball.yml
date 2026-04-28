@@ -1,15 +1,20 @@
-name: Baseball Notifier # v4
+name: Baseball Notifier
 
 on:
   schedule:
-    # Every 1 minute - script has smart frequency:
-    # 1min when tracked players have games, 10min otherwise
-    - cron: '* * * * *'
-  workflow_dispatch: # Allow manual trigger
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# 防止前一輪還沒跑完就觸發下一輪(若本輪卡住、後一輪會等)
+concurrency:
+  group: baseball-notifier
+  cancel-in-progress: false
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+    # 整個 job 上限 6 分鐘,超過就被 GitHub 強殺,跟原本 main() 內的 watchdog 雙重保險
+    timeout-minutes: 6
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,8 +25,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
 
+      # state.json 用 cache 跨 run 共享(不進 git history)
+      # 每次 run 用唯一 key 寫,fallback 抓最新的同前綴 cache 讀
       - name: Restore state cache
         uses: actions/cache@v4
         with:
