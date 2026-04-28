@@ -42,3 +42,20 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python baseball_notifier.py
+
+      # 失敗時推 TG 警告(curl 本身失敗也不影響 step,避免 nested failure)
+      - name: Notify Telegram on failure
+        if: ${{ failure() }}
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          MSG="⚠️ Baseball Notifier 雲端執行失敗
+          run id: ${{ github.run_id }}
+          時間: $(date -u +'%Y-%m-%d %H:%M UTC')
+          詳細 log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          下次 cron 5 分鐘內會自動重試,若連續失敗請手動檢查"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            > /dev/null || true
