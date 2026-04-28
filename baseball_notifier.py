@@ -2,19 +2,29 @@
 # -*- coding: utf-8 -*-
 """Baseball Player Notification Bot - MLB / 3A / NPB"""
 
-import re, requests, json, os, sys, signal
+import re, requests, json, os, sys, signal, threading
 from datetime import datetime, date, timedelta, timezone
 
 # 單次 main() 執行最大時間(秒)。launchd 每 5 分鐘觸發一次,
 # 設 240s(4 分鐘)留 60 秒緩衝給下一次正常排程。
-# 超時會強制 sys.exit(1),已 dedup 的 push 不會丟(寫入 state 是逐筆 append,
-# 但因為 main 結尾才 save_state,timeout 會丟掉本次未 save 的 dedup key →
-# 下次 run 可能重發某些通知,但比起 launchd 排程卡死整晚是更小的代價)。
+# 雙保險(2026-04-28):
+# (1) signal.SIGALRM + os._exit:Python signal handler 在「卡在 C 層 socket I/O」時可能不會觸發
+# (2) threading.Timer daemon watchdog:不依賴 Python 解譯器,時間到直接 os._exit 強殺
+# 兩道機制同時設,只要其中一道生效就能讓 launchd 準時排下一輪。
+# 代價:超時會丟掉本次未 save_state 的 dedup key → 下次 run 可能重發少數通知,
+# 比起 launchd 排程卡死整晚是更小的代價。
 MAX_RUNTIME_SECONDS = 240
+WATCHDOG_SECONDS = 250  # daemon watchdog,比 SIGALRM 晚 10 秒當作後備
 
 def _abort_on_timeout(signum, frame):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ main() exceeded {MAX_RUNTIME_SECONDS}s, aborting to keep launchd schedule alive")
-    sys.exit(1)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ main() exceeded {MAX_RUNTIME_SECONDS}s (SIGALRM), os._exit(1)")
+    sys.stdout.flush()
+    os._exit(1)
+
+def _watchdog_kill():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ watchdog {WATCHDOG_SECONDS}s exceeded, os._exit(2) — SIGALRM was swallowed (likely C-level socket hang)")
+    sys.stdout.flush()
+    os._exit(2)
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -460,10 +470,12 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                     log(f"Boxscore err {gp}: {e}")
     return notifs
 
-def _fetch_yahoo(url, timeout=8):
+def _fetch_yahoo(url, timeout=(5, 8)):
     """Fetch Yahoo Japan page with proper headers.
-    timeout 預設 8 秒(2026-04-28 從 15 秒降下,避免 schedule 頁列出的未來一週 game 一個個 fetch
-    時遇到 Yahoo Japan 慢就累積拖垮整個 main()。配合 NPB_BUDGET_SECONDS 用)。"""
+    timeout 用 tuple `(connect, read)`(2026-04-28 第二次調整):
+    - 單一數字 timeout 同時是 connect+read,但 read timeout 是「兩次 byte 間隔」不是整體上限,
+      Yahoo Japan 慢餵 byte 時可能卡 10+ 分鐘。改 tuple 顯式分開設,connect 5s + read 8s。
+    - 即使如此,真正卡死的最終保險是 main() 的 watchdog daemon thread(os._exit)。"""
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
@@ -625,17 +637,26 @@ def _check_npb_league(state, league, league_label):
     players_found_total = 0
     bailed_due_to_budget = False
 
+    def _budget_exceeded(stage):
+        """Check 累計耗時是否超過 NPB_BUDGET_SECONDS。在每次 fetch 前後都呼叫一次,
+        避免單一 fetch 卡很久時 budget 永遠檢查不到。"""
+        elapsed = datetime.now(timezone.utc).timestamp() - npb_start_ts
+        if elapsed > NPB_BUDGET_SECONDS:
+            log(f"NPB {league_label}: budget {NPB_BUDGET_SECONDS}s exceeded ({stage}) after {games_today} today/{len(game_ids)} total games — bailing rest")
+            return True
+        return False
+
     for game_id in game_ids:
-        # 預算保護:NPB 段最多花 NPB_BUDGET_SECONDS 秒,超過就停止處理剩下的 game,
-        # 讓 MLB / 3A 段已經做完的推播能正常 save_state,且不會撞到 main 的 240s SIGALRM
-        elapsed_npb = datetime.now(timezone.utc).timestamp() - npb_start_ts
-        if elapsed_npb > NPB_BUDGET_SECONDS:
-            log(f"NPB {league_label}: budget {NPB_BUDGET_SECONDS}s exceeded after {games_today} today/{len(game_ids)} total games — bailing rest")
+        # 預算保護:每場 game 處理前 + 兩次 fetch 之間都檢查,單一 fetch 卡住時也能 bail。
+        if _budget_exceeded("loop-head"):
             bailed_due_to_budget = True
             break
         # Fetch /top page for reliable game status (score/finished/lineup)
         top_url = f"https://baseball.yahoo.co.jp/npb/game/{game_id}/top"
         top_html = _fetch_yahoo(top_url)
+        if _budget_exceeded("after-top-fetch"):
+            bailed_due_to_budget = True
+            break
         if not top_html:
             continue
 
@@ -673,6 +694,9 @@ def _check_npb_league(state, league, league_label):
         # Fetch stats page (contains per-player batting/pitching tables)
         stats_url = f"https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
         stats_html = _fetch_yahoo(stats_url)
+        if _budget_exceeded("after-stats-fetch"):
+            bailed_due_to_budget = True
+            break
         if not stats_html:
             continue
 
@@ -935,9 +959,15 @@ def main():
     log("=" * 40)
     log("Baseball Notifier start")
     log(f"State file: {STATE_FILE}")
-    # 設定整個 main() 最大執行時間,避免 NPB Yahoo Japan timeout 累積拖垮 launchd 排程
+    # 防呆雙保險(2026-04-28):
+    # (1) signal.SIGALRM:240s 後送信號,handler 用 os._exit(1)
+    # (2) threading.Timer daemon watchdog:250s 後直接 os._exit(2),不依賴 Python signal
+    # 後者是為了應付 SIGALRM 被 C 層 socket I/O 吞掉的情境
     signal.signal(signal.SIGALRM, _abort_on_timeout)
     signal.alarm(MAX_RUNTIME_SECONDS)
+    watchdog = threading.Timer(WATCHDOG_SECONDS, _watchdog_kill)
+    watchdog.daemon = True
+    watchdog.start()
     state = load_state()
 
     # One-time cleanup: clear stale NPB keys from old broken detection logic.
@@ -971,6 +1001,8 @@ def main():
         # No tracked team games - only check every 10 minutes
         log(f"No tracked team games today, last run {int(elapsed)}s ago, skipping (10min interval)")
         save_state(state)  # 即使早返也要存,免得 discovery 結果丟失
+        signal.alarm(0)
+        watchdog.cancel()
         log("=" * 40)
         return
     else:
@@ -1008,7 +1040,8 @@ def main():
             log("Send failed")
 
     save_state(state)
-    signal.alarm(0)  # 正常結束前關掉 timeout
+    signal.alarm(0)  # 正常結束前關掉 SIGALRM
+    watchdog.cancel()  # 正常結束前關掉 watchdog daemon
     log(f"Done! Sent {sent}/{len(all_notifs)} notifications")
     log("=" * 40)
 
