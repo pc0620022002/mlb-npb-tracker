@@ -2,8 +2,8 @@ name: Baseball Notifier
 
 on:
   schedule:
-    # 每 2 小時 fallback(主要靠 polling loop 內 self-trigger relay,cron 是保險)
-    - cron: '17 */2 * * *'
+    # 每 1 小時 fallback(萬一 self-trigger 全部失敗的最後保險)
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 # self-trigger relay 需要 actions:write;cache 用 default contents:read 即可
@@ -56,12 +56,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           DEFAULT_INTERVAL=120           # 預設 2 分鐘(有比賽);程式跑完會更新 state.json
-          LOOP_DURATION=19500            # 5h25m
-          RELAY_LEAD_TIME=600            # 提前 10 分鐘 self-trigger 接力(即跑到 5h15m 觸發、5h25m 退出)
-          END=$(( $(date +%s) + LOOP_DURATION ))
+          LOOP_DURATION=19500            # 5h25m,run 內部跑迴圈的總時長
+          RELAY_PROACTIVE_AT=9750        # 跑到一半(2h42m)就開始嘗試 self-trigger relay
+          RELAY_RETRY_GAP=600            # 每 10 分鐘嘗試一次,共有約 16 次機會
+          START_TS=$(date +%s)
+          END=$(( START_TS + LOOP_DURATION ))
           CONSECUTIVE_FAILS=0
           ITERATION=0
           RELAY_TRIGGERED=0
+          LAST_RELAY_ATTEMPT=0
+          RELAY_ATTEMPT_COUNT=0
           while [ $(date +%s) -lt $END ]; do
             ITERATION=$((ITERATION + 1))
             echo "::group::Iteration ${ITERATION} at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
@@ -86,39 +90,40 @@ jobs:
             SLEEP=$(( POLL_INTERVAL - ELAPSED ))
             REMAINING=$(( END - $(date +%s) ))
 
-            # ⭐ self-trigger relay:剩 RELAY_LEAD_TIME 時連續 try 3 次叫接班 run,只要任一次 204 就 break
-            #    全部 3 次都失敗 → 推一條 TG 警告 + 繼續跑直到 LOOP_DURATION 末尾(讓 cron fallback 接手)
-            if [ "$RELAY_TRIGGERED" = "0" ] && [ $REMAINING -lt $RELAY_LEAD_TIME ]; then
-              for relay_attempt in 1 2 3; do
-                echo "Relay attempt ${relay_attempt}/3 (remaining=${REMAINING}s)"
-                HTTP_STATUS=$(curl -sS -o /tmp/relay_resp.json -w "%{http_code}" -X POST \
-                  -H "Authorization: token ${GH_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "https://api.github.com/repos/${GH_REPO}/actions/workflows/baseball.yml/dispatches" \
-                  -d '{"ref":"main"}' || echo "curl_failed")
-                echo "  attempt ${relay_attempt} HTTP=${HTTP_STATUS}"
-                if [ "$HTTP_STATUS" = "204" ]; then
-                  RELAY_TRIGGERED=1
-                  break
-                fi
-                cat /tmp/relay_resp.json 2>/dev/null || true
-                if [ $relay_attempt -lt 3 ]; then
-                  echo "  retrying in 30s..."
-                  sleep 30
-                fi
-              done
-              if [ "$RELAY_TRIGGERED" = "1" ]; then
-                echo "Relay triggered OK, exiting loop early so concurrency:cancel-in-progress can hand over"
-                break
+            # ⭐ self-trigger relay:跑到 RELAY_PROACTIVE_AT(2h42m,跑到一半)就開始嘗試
+            #    每 RELAY_RETRY_GAP(10 分鐘)試一次,共有 ~16 次機會直到 LOOP_DURATION 結束
+            #    第一次 204 成功 → RELAY_TRIGGERED=1;新 run 啟動後 concurrency 會 cancel 我,save-always cache 仍會 fire
+            #    舊版只在「剩 10 分鐘」試 3 次,如果那 30 秒剛好 GHA API 抖動就全敗 → 空白
+            NOW_TS=$(date +%s)
+            ELAPSED_SINCE_START=$((NOW_TS - START_TS))
+            if [ "$RELAY_TRIGGERED" = "0" ] && [ $ELAPSED_SINCE_START -gt $RELAY_PROACTIVE_AT ] && [ $((NOW_TS - LAST_RELAY_ATTEMPT)) -gt $RELAY_RETRY_GAP ]; then
+              RELAY_ATTEMPT_COUNT=$((RELAY_ATTEMPT_COUNT + 1))
+              echo "Self-trigger relay attempt #${RELAY_ATTEMPT_COUNT} (elapsed=${ELAPSED_SINCE_START}s of ${LOOP_DURATION}s)"
+              LAST_RELAY_ATTEMPT=$NOW_TS
+              HTTP_STATUS=$(curl -sS -o /tmp/relay_resp.json -w "%{http_code}" -X POST \
+                -H "Authorization: token ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GH_REPO}/actions/workflows/baseball.yml/dispatches" \
+                -d '{"ref":"main"}' || echo "curl_failed")
+              echo "  HTTP=${HTTP_STATUS}"
+              if [ "$HTTP_STATUS" = "204" ]; then
+                RELAY_TRIGGERED=1
+                echo "Relay triggered OK on attempt #${RELAY_ATTEMPT_COUNT};新 run 即將啟動 → concurrency 將 cancel 此 run"
+                # 不 break — 讓最後幾分鐘 polling 仍在跑,等新 run 啟動 cancel 我;always-save fire
               else
-                # 三次都失敗 — 推 TG 警告(self-trigger 是主機制,失敗代表要靠不準的 cron 救)
-                MSG=$(printf '🚨 self-trigger relay 連續 3 次失敗\nrun: %s\n程式已盡力,接下來只能等 cron fallback(最多 2h)接手\n請手動檢查 GHA API 是否正常 / token 是否有效' "${RUN_URL}")
-                curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
-                  --data-urlencode "text=${MSG}" >/dev/null || true
-                echo "All 3 relay attempts failed; continuing loop until LOOP_DURATION ends (cron fallback will pick up later)"
+                cat /tmp/relay_resp.json 2>/dev/null || true
+                echo "  attempt failed; will retry in ${RELAY_RETRY_GAP}s"
               fi
+            fi
+
+            # 如果 LOOP_DURATION 快結束(剩 < POLL_INTERVAL)且 self-trigger 從未成功 → 推 TG + break
+            if [ "$RELAY_TRIGGERED" = "0" ] && [ $REMAINING -lt $POLL_INTERVAL ]; then
+              MSG=$(printf '🚨 self-trigger relay 全程 %s 次嘗試都失敗\nrun: %s\n只能等 cron fallback(最多 1 小時)接手\n請檢查 GHA API / GITHUB_TOKEN actions:write 權限' "${RELAY_ATTEMPT_COUNT}" "${RUN_URL}")
+              curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=${MSG}" >/dev/null || true
+              echo "All ${RELAY_ATTEMPT_COUNT} relay attempts failed; cron will pick up within 1h"
             fi
 
             if [ $REMAINING -lt $POLL_INTERVAL ]; then
