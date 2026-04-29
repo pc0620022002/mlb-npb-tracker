@@ -2,9 +2,14 @@ name: Baseball Notifier
 
 on:
   schedule:
-    # 每 6 小時觸發新 long-running job(避開整點以減少 GHA 延遲)
-    - cron: '7 */6 * * *'
+    # 每 2 小時 fallback(主要靠 polling loop 內 self-trigger relay,cron 是保險)
+    - cron: '17 */2 * * *'
   workflow_dispatch:
+
+# self-trigger relay 需要 actions:write;cache 用 default contents:read 即可
+permissions:
+  contents: read
+  actions: write
 
 # 新 run 觸發時取消舊 run(配合 save-always cache,確保 state 在 cancel 時也存到)
 concurrency:
@@ -37,22 +42,26 @@ jobs:
           restore-keys: |
             baseball-state-
 
-      # 不靠 GHA cron(每 5 分鐘不準),改在 run 內 bash 迴圈呼叫 notifier
-      # 跑 5h45m 然後乾淨退出,留時間給 cache save。下一個 cron 6 小時後接手
-      # polling interval 由 baseball_notifier.py 寫進 state["_next_poll_interval"]:
-      #   有比賽日 → 120s(2 分鐘)
-      #   沒比賽日 → 600s(10 分鐘)
+      # 不靠 GHA cron 接力(實測延遲 1-2 小時,造成空白 stall)。
+      # 改在 run 內主動 self-trigger 接力 run:跑到剩 RELAY_LEAD_TIME 時呼叫 GHA API
+      # workflow_dispatch 觸發新 run,新 run 啟動後 concurrency cancel 舊 run,
+      # 舊 run 的 save-always cache step 仍會 fire 把最新 state 存進去,新 run restore 接續。
+      # cron `17 */2 * * *` 是 fallback,若 self-trigger 失敗也最多 2 小時恢復。
       - name: Polling loop
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           DEFAULT_INTERVAL=120           # 預設 2 分鐘(有比賽);程式跑完會更新 state.json
-          LOOP_DURATION=20700            # 5h45m,讓下一輪 cron(7 minute past)接得上
+          LOOP_DURATION=19500            # 5h25m
+          RELAY_LEAD_TIME=600            # 提前 10 分鐘 self-trigger 接力(即跑到 5h15m 觸發、5h25m 退出)
           END=$(( $(date +%s) + LOOP_DURATION ))
           CONSECUTIVE_FAILS=0
           ITERATION=0
+          RELAY_TRIGGERED=0
           while [ $(date +%s) -lt $END ]; do
             ITERATION=$((ITERATION + 1))
             echo "::group::Iteration ${ITERATION} at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
@@ -65,7 +74,6 @@ jobs:
               CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
               echo "[ERR] iteration ${ITERATION} exited ${EXIT_CODE}, consecutive_fails=${CONSECUTIVE_FAILS}"
               echo "::endgroup::"
-              # 只在第一次失敗推 TG(避免連續失敗 spam)
               if [ "$CONSECUTIVE_FAILS" = "1" ]; then
                 MSG=$(printf '⚠️ Baseball Notifier 單輪失敗\nexit code: %s\nlog: %s\n迴圈仍在跑,稍後會再試' "${EXIT_CODE}" "${RUN_URL}")
                 curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
@@ -73,12 +81,32 @@ jobs:
                   --data-urlencode "text=${MSG}" >/dev/null || true
               fi
             fi
-            # 讀程式寫進 state.json 的下次 polling interval(有比賽 120s / 沒比賽 600s)
             POLL_INTERVAL=$(python3 -c "import json,sys; sys.stdout.write(str(json.load(open('state.json')).get('_next_poll_interval', $DEFAULT_INTERVAL)))" 2>/dev/null || echo $DEFAULT_INTERVAL)
             ELAPSED=$(( $(date +%s) - START ))
             SLEEP=$(( POLL_INTERVAL - ELAPSED ))
             REMAINING=$(( END - $(date +%s) ))
-            # 若離 LOOP_DURATION 結束時間少於下一次 polling,直接結束讓 cache save
+
+            # ⭐ self-trigger relay run 提前接力(避免靠 GHA cron,因為實測 cron 會延遲 1-2 小時)
+            if [ "$RELAY_TRIGGERED" = "0" ] && [ $REMAINING -lt $RELAY_LEAD_TIME ]; then
+              echo "Triggering relay run (remaining=${REMAINING}s, run will exit early to hand over)"
+              HTTP_STATUS=$(curl -sS -o /tmp/relay_resp.json -w "%{http_code}" -X POST \
+                -H "Authorization: token ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GH_REPO}/actions/workflows/baseball.yml/dispatches" \
+                -d '{"ref":"main"}' || echo "curl_failed")
+              echo "Relay trigger HTTP=${HTTP_STATUS}"
+              if [ "$HTTP_STATUS" = "204" ]; then
+                RELAY_TRIGGERED=1
+                echo "Relay triggered OK, exiting loop early so concurrency:cancel-in-progress can hand over cleanly"
+                break
+              else
+                echo "Relay trigger FAILED (response below); will rely on cron fallback or retry next iter"
+                cat /tmp/relay_resp.json 2>/dev/null || true
+                # 不 break,繼續跑直到 LOOP_DURATION 結束(讓 cron 接手)
+              fi
+            fi
+
             if [ $REMAINING -lt $POLL_INTERVAL ]; then
               echo "Loop ending: remaining ${REMAINING}s < interval ${POLL_INTERVAL}s"
               break
@@ -88,7 +116,7 @@ jobs:
               sleep $SLEEP
             fi
           done
-          echo "Loop finished after ${ITERATION} iterations"
+          echo "Loop finished after ${ITERATION} iterations (relay_triggered=${RELAY_TRIGGERED})"
 
       # 不論 success / failure / cancel,都把最新 state 存回 cache
       - name: Save state cache
