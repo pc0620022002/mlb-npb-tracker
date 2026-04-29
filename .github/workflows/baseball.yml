@@ -2,19 +2,20 @@ name: Baseball Notifier
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # 每 6 小時觸發新 long-running job(避開整點以減少 GHA 延遲)
+    - cron: '7 */6 * * *'
   workflow_dispatch:
 
-# 防止前一輪還沒跑完就觸發下一輪(若本輪卡住、後一輪會等)
+# 新 run 觸發時取消舊 run(配合 save-always cache,確保 state 在 cancel 時也存到)
 concurrency:
   group: baseball-notifier
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    # 整個 job 上限 6 分鐘,超過就被 GitHub 強殺,跟原本 main() 內的 watchdog 雙重保險
-    timeout-minutes: 6
+    # 整個 job 上限 5h55m(6 小時減 5 分鐘 margin)
+    timeout-minutes: 355
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,35 +28,85 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # state.json 用 cache 跨 run 共享(不進 git history)
-      # 每次 run 用唯一 key 寫,fallback 抓最新的同前綴 cache 讀
+      # state.json 跨 run 共享。用 restore + save 分開,save 放後面 always() 確保 cancel/timeout 也存
       - name: Restore state cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: state.json
           key: baseball-state-${{ github.run_id }}
           restore-keys: |
             baseball-state-
 
-      - name: Run notifier
+      # 不靠 GHA cron(每 5 分鐘不準),改在 run 內 bash 迴圈每 5 分鐘呼叫一次 notifier
+      # 跑 5h45m 然後乾淨退出,留時間給 cache save。下一個 cron 6 小時後接手
+      - name: Polling loop
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python baseball_notifier.py
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          POLL_INTERVAL=300              # 5 分鐘
+          LOOP_DURATION=20700            # 5h45m,讓下一輪 cron(7 minute past)接得上
+          END=$(( $(date +%s) + LOOP_DURATION ))
+          CONSECUTIVE_FAILS=0
+          ITERATION=0
+          while [ $(date +%s) -lt $END ]; do
+            ITERATION=$((ITERATION + 1))
+            echo "::group::Iteration ${ITERATION} at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            START=$(date +%s)
+            if python baseball_notifier.py; then
+              CONSECUTIVE_FAILS=0
+              echo "::endgroup::"
+            else
+              EXIT_CODE=$?
+              CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
+              echo "[ERR] iteration ${ITERATION} exited ${EXIT_CODE}, consecutive_fails=${CONSECUTIVE_FAILS}"
+              echo "::endgroup::"
+              # 只在第一次失敗推 TG(避免連續失敗 spam)
+              if [ "$CONSECUTIVE_FAILS" = "1" ]; then
+                MSG="⚠️ Baseball Notifier 單輪失敗
+exit code: ${EXIT_CODE}
+log: ${RUN_URL}
+迴圈仍在跑,5 分鐘後會再試"
+                curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                  --data-urlencode "text=${MSG}" >/dev/null || true
+              fi
+            fi
+            ELAPSED=$(( $(date +%s) - START ))
+            SLEEP=$(( POLL_INTERVAL - ELAPSED ))
+            REMAINING=$(( END - $(date +%s) ))
+            # 若離 LOOP_DURATION 結束時間少於下一次 polling,直接結束讓 cache save
+            if [ $REMAINING -lt $POLL_INTERVAL ]; then
+              echo "Loop ending: remaining ${REMAINING}s < interval ${POLL_INTERVAL}s"
+              break
+            fi
+            if [ $SLEEP -gt 0 ]; then
+              sleep $SLEEP
+            fi
+          done
+          echo "Loop finished after ${ITERATION} iterations"
 
-      # 失敗時推 TG 警告(curl 本身失敗也不影響 step,避免 nested failure)
-      - name: Notify Telegram on failure
+      # 不論 success / failure / cancel,都把最新 state 存回 cache
+      - name: Save state cache
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: baseball-state-${{ github.run_id }}
+
+      # workflow 整段失敗(不是單輪失敗 — 那個 loop 內部已處理)時推 TG
+      - name: Notify Telegram on workflow failure
         if: ${{ failure() }}
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          MSG="⚠️ Baseball Notifier 雲端執行失敗
-          run id: ${{ github.run_id }}
-          時間: $(date -u +'%Y-%m-%d %H:%M UTC')
-          詳細 log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          下次 cron 5 分鐘內會自動重試,若連續失敗請手動檢查"
+          MSG="🚨 Baseball Notifier workflow 整段失敗(非單輪失敗)
+run id: ${{ github.run_id }}
+時間: $(date -u +'%Y-%m-%d %H:%M UTC')
+詳細 log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+請手動檢查並重新觸發 workflow"
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            > /dev/null || true
+            --data-urlencode "text=${MSG}" >/dev/null || true
