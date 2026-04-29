@@ -130,17 +130,33 @@ def _recent(k, today):
     return True
 
 def send_tg(msg):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10)
-        if not r.ok:
-            log(f"TG err: {r.status_code} {r.text[:80]}")
-        return r.ok
-    except Exception as e:
-        log(f"TG err: {e}")
-        return False
+    """推送 Telegram 訊息。connection / timeout / 5xx / 429 自動 backoff retry 2 次(0.5s, 2s)。
+    4xx 不重試(訊息格式錯 / token 失效之類,重試也沒用)。
+    避免 Telegram API 偶發抖動造成「明明事件對但訊息丟掉」的隱性漏推。"""
+    import time as _time
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=10)
+            if r.ok:
+                return True
+            if r.status_code >= 500 or r.status_code == 429:
+                last_err = f"HTTP {r.status_code}"
+            else:
+                # 4xx(400 訊息格式 / 401 token / 403 chat 等)重試無用
+                log(f"TG err (no retry): {r.status_code} {r.text[:80]}")
+                return False
+        except Exception as e:
+            last_err = type(e).__name__ + ": " + str(e)[:120]
+        if attempt < 2:
+            sleep_s = (0.5, 2.0)[attempt]
+            log(f"  TG retry {attempt+1}/2 in {sleep_s}s ({last_err})")
+            _time.sleep(sleep_s)
+    log(f"TG send FAILED after 3 attempts: {last_err}")
+    return False
 
 def _send_alert(msg):
     """系統層級警告(失聯/漏推),失敗不影響後續。"""
@@ -228,8 +244,8 @@ def _translate_event(event):
 def _get_mlb_at_bats(gp, pid):
     """Fetch per-at-bat results for a player via playByPlay. Returns list of (event_zh, rbi) tuples."""
     try:
-        r = requests.get(f"https://statsapi.mlb.com/api/v1/game/{gp}/playByPlay", timeout=12)
-        if not r.ok:
+        r = _robust_get(f"https://statsapi.mlb.com/api/v1/game/{gp}/playByPlay", timeout=12)
+        if r is None or not r.ok:
             return []
         plays = r.json().get("allPlays", [])
         target = int(pid)
@@ -273,11 +289,11 @@ def _get_season_stats(pid):
     result = {"avg": None, "era": None}
     try:
         year = date.today().year
-        r = requests.get(
+        r = _robust_get(
             f"https://statsapi.mlb.com/api/v1/people/{pid}/stats",
             params={"stats": "season", "season": year, "group": "hitting,pitching"},
             timeout=10)
-        if r.ok:
+        if r and r.ok:
             for stat_group in r.json().get("stats", []):
                 splits = stat_group.get("splits", [])
                 if splits:
@@ -340,10 +356,11 @@ def check_schedule(sport_id, prefix, label, state, players=None):
     all_games_data = []
     for check_date in dates_to_check:
         try:
-            r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+            r = _robust_get("https://statsapi.mlb.com/api/v1/schedule",
                 params={"sportId": sport_id, "date": check_date,
                         "hydrate": "lineups,team,probablePitcher,score"}, timeout=15)
-            r.raise_for_status()
+            if r is None or not r.ok:
+                continue  # _robust_get 已經 retry 過,放棄這個 date 進下一輪
             data = r.json()
             for de in data.get("dates", []):
                 for g in de.get("games", []):
@@ -386,7 +403,8 @@ def check_schedule(sport_id, prefix, label, state, players=None):
             # --- Mid-game appearance AND Final results (combined) ---
             if abst in ("Live", "Final"):
                 try:
-                    br = requests.get(f"https://statsapi.mlb.com/api/v1/game/{gp}/boxscore", timeout=12).json()
+                    _br_r = _robust_get(f"https://statsapi.mlb.com/api/v1/game/{gp}/boxscore", timeout=12)
+                    br = _br_r.json() if _br_r and _br_r.ok else {}
                     for bside in ["home","away"]:
                         pls = br.get("teams",{}).get(bside,{}).get("players",{})
                         for pk, pv in pls.items():
@@ -867,9 +885,9 @@ def discover_asian_players(state):
     # 預抓 AAA 隊伍 → 母 MLB org id 對照(3A 球員 currentTeam.id 是 3A 隊 id,要轉成母球團)
     aaa_to_parent = {}
     try:
-        rt = requests.get("https://statsapi.mlb.com/api/v1/teams",
+        rt = _robust_get("https://statsapi.mlb.com/api/v1/teams",
             params={"sportId": 11, "season": date.today().year}, timeout=10)
-        if rt.ok:
+        if rt and rt.ok:
             for t in rt.json().get("teams", []):
                 p = t.get("parentOrgId")
                 if p:
@@ -879,9 +897,9 @@ def discover_asian_players(state):
 
     for sport_id, allowed_origins in _DISCOVERY_BY_SPORT.items():
         try:
-            r = requests.get(f"https://statsapi.mlb.com/api/v1/sports/{sport_id}/players",
+            r = _robust_get(f"https://statsapi.mlb.com/api/v1/sports/{sport_id}/players",
                 params={"season": date.today().year}, timeout=20)
-            if not r.ok:
+            if r is None or not r.ok:
                 continue
             for p in r.json().get("people", []):
                 origin = _BIRTH_COUNTRY_TO_ORIGIN.get(p.get("birthCountry", ""))
@@ -1014,9 +1032,9 @@ def _tracked_teams_have_games(state):
         """Scan a sport schedule, return True if any game is active right now."""
         for d in dates_to_check:
             try:
-                r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+                r = _robust_get("https://statsapi.mlb.com/api/v1/schedule",
                     params={"sportId": sport_id, "date": d}, timeout=10)
-                if not r.ok:
+                if r is None or not r.ok:
                     continue
                 for de in r.json().get("dates", []):
                     for g in de.get("games", []):
@@ -1043,9 +1061,9 @@ def _tracked_teams_have_games(state):
     # --- 3A:resolve parent org first ---
     aaa_to_parent = {}
     try:
-        rt = requests.get("https://statsapi.mlb.com/api/v1/teams",
+        rt = _robust_get("https://statsapi.mlb.com/api/v1/teams",
             params={"sportId": 11, "season": str(today.year)}, timeout=10)
-        if rt.ok:
+        if rt and rt.ok:
             for t in rt.json().get("teams", []):
                 p = t.get("parentOrgId")
                 if p:
@@ -1103,6 +1121,11 @@ def main():
     log("=" * 40)
     log("Baseball Notifier start")
     log(f"State file: {STATE_FILE}")
+    # 啟動驗證:TG_TOKEN / TG_CHAT_ID 缺失時 log 明顯警告(不 exit,讓 state 仍可更新)
+    if not TOKEN or not CHAT_ID:
+        log(f"⚠️ MISSING ENV: TG_TOKEN={'set' if TOKEN else 'EMPTY'} TG_CHAT_ID={'set' if CHAT_ID else 'EMPTY'}")
+        log(f"   程式仍會跑(state / discovery 有意義),但所有 send_tg 會失敗")
+        log(f"   請至 GitHub Secrets 設定")
     # 防呆雙保險(2026-04-28):
     # (1) signal.SIGALRM:240s 後送信號,handler 用 os._exit(1)
     # (2) threading.Timer daemon watchdog:250s 後直接 os._exit(2),不依賴 Python signal
