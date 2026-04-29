@@ -145,14 +145,32 @@ jobs:
           path: state.json
           key: baseball-state-${{ github.run_id }}
 
-      # workflow 整段失敗(不是單輪失敗 — 那個 loop 內部已處理)時推 TG
-      - name: Notify Telegram on workflow failure
+      # workflow 整段失敗(非單輪失敗)時:推 TG 警告 + 自動 trigger 接班 run
+      # B 保險:run 中段 crash(watchdog kill / OOM / setup error)沒走到 self-trigger 也能自動接班
+      - name: Notify Telegram + auto-trigger relay on workflow failure
         if: ${{ failure() }}
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          MSG=$(printf '🚨 Baseball Notifier workflow 整段失敗(非單輪失敗)\nrun id: %s\n時間: %s\n詳細 log: https://github.com/%s/actions/runs/%s\n請手動檢查並重新觸發 workflow' "${{ github.run_id }}" "$(date -u +'%Y-%m-%d %H:%M UTC')" "${{ github.repository }}" "${{ github.run_id }}")
+          # 先嘗試自動觸發接班 run(失敗也不影響後續 TG 推播)
+          echo "Attempting auto-relay on failure..."
+          RELAY_HTTP=$(curl -sS -o /tmp/relay.json -w "%{http_code}" -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GH_REPO}/actions/workflows/baseball.yml/dispatches" \
+            -d '{"ref":"main"}' || echo "curl_failed")
+          echo "auto-relay HTTP=${RELAY_HTTP}"
+          if [ "$RELAY_HTTP" = "204" ]; then
+            RELAY_NOTE="✅ 已自動觸發接班 run,1-2 分鐘內接手"
+          else
+            RELAY_NOTE="❌ 自動接班失敗 (HTTP ${RELAY_HTTP});等 cron fallback(最多 1h)接手"
+            cat /tmp/relay.json 2>/dev/null || true
+          fi
+          MSG=$(printf '🚨 Baseball Notifier workflow 整段失敗(非單輪失敗)\nrun id: %s\n時間: %s\n詳細 log: https://github.com/%s/actions/runs/%s\n%s' "${{ github.run_id }}" "$(date -u +'%Y-%m-%d %H:%M UTC')" "${{ github.repository }}" "${{ github.run_id }}" "${RELAY_NOTE}")
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
             --data-urlencode "text=${MSG}" >/dev/null || true

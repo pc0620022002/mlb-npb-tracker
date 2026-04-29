@@ -113,12 +113,25 @@ def load_state():
     return {}
 
 def save_state(state):
+    """Atomic write:先寫 .tmp 再 os.replace 到目標檔。
+    避免 cancel/timeout 期間寫到一半 → state.json 被 corrupt → 下次 load 失敗。
+    os.replace() 在 POSIX 上是原子操作,不會看到中間狀態。"""
     today = date.today()
     cleaned = {k: v for k, v in state.items()
                if any(k.startswith(p) for p in ["mlb_","aaa_","npb_"]) is False
                or _recent(k, today)}
-    with open(STATE_FILE, "w") as f:
-        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+    tmp_path = STATE_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as e:
+        log(f"save_state err: {e}")
+        # 清掉殘留 tmp 檔避免下次混淆
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 def _recent(k, today):
     parts = k.split("_")
@@ -1155,6 +1168,12 @@ def main():
     # 必須在 _tracked_teams_have_games 之前,因為動態名單會影響「今天哪些隊在打」的判斷
     discover_asian_players(state)
 
+    # ⭐ Cold-start 偵測:state 為空(沒 _last_ok_ts 也沒 _last_run_ts) → 本輪 suppress 所有 send_tg
+    # 用途:第一次部署 / cache 遺失 / state corrupt 救回 — 避免把「今天所有舊事件」當新事件 spam
+    cold_start = ("_last_ok_ts" not in state) and ("_last_run_ts" not in state)
+    if cold_start:
+        log("⚠️ COLD START detected (no _last_ok_ts and no _last_run_ts in state)")
+
     # ⭐ 自我健檢 + 動態 polling interval(2026-04-29 重寫)
     # 雲端 long-running run 透過 yaml bash loop 每 N 秒呼叫一次,
     # N 由本程式寫進 state["_next_poll_interval"](有比賽 120s,沒比賽 600s)。
@@ -1206,12 +1225,20 @@ def main():
     log(f"  -> {len(all_notifs)-n} NPB 1軍 notifications")
 
     sent = 0
-    for msg in all_notifs:
-        if send_tg(msg):
-            sent += 1
-            log(f"Sent: {msg[:50].replace(chr(10),' ')}...")
-        else:
-            log("Send failed")
+    if cold_start:
+        # state 為空(初次部署 / cache 遺失 / corrupt 救回) → 所有 dedup key 已寫進 state,
+        # 但訊息不送出。避免「補推今天所有舊事件」spam(user 過去因 cache miss 一次收 16+ 條的問題)
+        # 真正中段漏掉的事件靠 final 推播時的 "[系統補推]" 標籤抓回(那條會送)
+        log(f"COLD START: state was empty, suppressing {len(all_notifs)} backfill notif(s) (only marking dedup keys)")
+        for msg in all_notifs:
+            log(f"  suppressed: {msg[:60].replace(chr(10),' ')}...")
+    else:
+        for msg in all_notifs:
+            if send_tg(msg):
+                sent += 1
+                log(f"Sent: {msg[:50].replace(chr(10),' ')}...")
+            else:
+                log("Send failed")
 
     # ⭐ 跑成功 → 寫 _last_ok_ts + _next_poll_interval(yaml bash loop 會讀後者決定下次 sleep)
     state["_last_ok_ts"] = now_ts
