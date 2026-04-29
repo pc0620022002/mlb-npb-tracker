@@ -885,6 +885,16 @@ def _check_npb_league(state, league, league_label):
     bail_note = " [⚠️ BAILED ON BUDGET]" if bailed_due_to_budget else ""
     log(f"NPB {league_label} summary: {games_with_stats} with stats, {games_today} today, {games_with_lineup_checked} checked for lineup, {players_found_total} player appearances, {npb_total_secs}s elapsed{bail_note}")
 
+    # 如果 NPB 段被 budget 強制截斷 → 推 TG 警告(每 6 小時最多 1 條,避免 NPB 持續慢時 spam)
+    if bailed_due_to_budget:
+        last_alert_ts = state.get(f"_npb_budget_bail_alert_ts_{league}", 0)
+        now_ts_alert = datetime.now(timezone.utc).timestamp()
+        if now_ts_alert - last_alert_ts > 21600:
+            _send_alert(f"⚠️ <b>[NPB {league_label} 處理被 90s budget 強制截斷]</b>\n"
+                        f"已處理 {games_today}/{len(game_ids)} 場,總耗時 {npb_total_secs}s 超過上限。\n"
+                        f"<i>剩餘場次本輪沒檢查,可能漏掉部分 NPB 推播。Yahoo Japan 慢時會發生,持續發生請查 GHA log</i>")
+            state[f"_npb_budget_bail_alert_ts_{league}"] = now_ts_alert
+
     return notifs
 
 # --- 自動偵測亞洲球員 ---
