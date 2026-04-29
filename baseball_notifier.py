@@ -142,6 +142,39 @@ def send_tg(msg):
         log(f"TG err: {e}")
         return False
 
+def _send_alert(msg):
+    """系統層級警告(失聯/漏推),失敗不影響後續。"""
+    try:
+        return send_tg(msg)
+    except Exception as e:
+        log(f"Alert err: {e}")
+        return False
+
+def _robust_get(url, retries=2, backoff_seq=(0.5, 2.0), **kwargs):
+    """requests.get 包裝,connection / timeout / 5xx 自動 backoff retry。
+    4xx 不重試(client 端錯誤,重試也沒用)。
+    返回 Response 或 None(用盡 retries)。"""
+    import time as _time
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, **kwargs)
+            if r.status_code == 200:
+                return r
+            if r.status_code >= 500:
+                last_err = f"HTTP {r.status_code}"
+            else:
+                # 4xx → 不重試
+                return r
+        except Exception as e:
+            last_err = type(e).__name__ + ": " + str(e)[:120]
+        if attempt < retries:
+            sleep_s = backoff_seq[min(attempt, len(backoff_seq)-1)]
+            log(f"  retry {attempt+1}/{retries} in {sleep_s}s ({last_err}): {url[:80]}")
+            _time.sleep(sleep_s)
+    log(f"  FAILED after {retries+1} attempts ({last_err}): {url[:80]}")
+    return None
+
 def to_tw(iso):
     if not iso: return "未知"
     try:
@@ -413,14 +446,17 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         state[live_key] = current_snap
 
                                 # --- First appearance for games already Final (no live updates sent) ---
+                                # 「final_only」標記代表中段沒推過 live → 比賽結果訊息會額外加漏推警示
+                                live_key = f"{prefix}_{game_date_str}_live_{gp}_{pid_str}"
                                 if played and abst == "Final":
-                                    live_key = f"{prefix}_{game_date_str}_live_{gp}_{pid_str}"
                                     if live_key not in state:
                                         state[live_key] = "final_only"
 
                                 # --- Final result notification (only when game is finished) ---
                                 if abst == "Final" and played:
                                     final_key = f"{prefix}_{game_date_str}_final_{gp}_{pid_str}"
+                                    # 漏推偵測:中段從未推 live → 補一條警示前綴
+                                    is_missed_live = state.get(live_key) == "final_only"
                                     if final_key not in state:
                                         lines = []
                                         # Get season stats from boxscore; fallback to API
@@ -464,25 +500,27 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         if not lines:
                                             lines.append("出場（無打擊/投球紀錄）")
                                         stat_str = "\n".join(lines)
-                                        notifs.append(f"\u26be <b>[{label} 比賽結果]</b>\n\U0001f3df {matchup}\n\U0001f4ca {away} <b>{aws}</b> - <b>{hs}</b> {home}\n\U0001f464 <b>{m}</b>：\n{stat_str}")
+                                        if is_missed_live:
+                                            header = (f"\u26a0\ufe0f <b>[{label} 比賽結果 — 系統補推]</b>\n"
+                                                      f"<i>此球員從未在 live 階段被推播,中段過程可能因系統空白漏掉</i>\n"
+                                                      f"\u26be 完整本場紀錄:")
+                                        else:
+                                            header = f"\u26be <b>[{label} 比賽結果]</b>"
+                                        notifs.append(f"{header}\n\U0001f3df {matchup}\n\U0001f4ca {away} <b>{aws}</b> - <b>{hs}</b> {home}\n\U0001f464 <b>{m}</b>：\n{stat_str}")
                                         state[final_key] = True
                 except Exception as e:
                     log(f"Boxscore err {gp}: {e}")
     return notifs
 
 def _fetch_yahoo(url, timeout=(5, 8)):
-    """Fetch Yahoo Japan page with proper headers.
-    timeout 用 tuple `(connect, read)`(2026-04-28 第二次調整):
-    - 單一數字 timeout 同時是 connect+read,但 read timeout 是「兩次 byte 間隔」不是整體上限,
-      Yahoo Japan 慢餵 byte 時可能卡 10+ 分鐘。改 tuple 顯式分開設,connect 5s + read 8s。
-    - 即使如此,真正卡死的最終保險是 main() 的 watchdog daemon thread(os._exit)。"""
+    """Fetch Yahoo Japan page with proper headers + backoff retry.
+    timeout 用 tuple `(connect, read)`,connect 5s + read 8s。
+    transient 失敗(connection error / timeout / 5xx)會 retry 2 次(0.5s, 2s)。
+    最終卡死的最後保險是 main() 的 watchdog daemon thread(os._exit)。"""
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            return r.text
-    except Exception as e:
-        log(f"Fetch err {url}: {e}")
+    r = _robust_get(url, headers=headers, timeout=timeout)
+    if r is not None and r.status_code == 200:
+        return r.text
     return None
 
 def _extract_npb_batting(html, search_patterns):
@@ -755,8 +793,18 @@ def _check_npb_league(state, league, league_label):
                 else:
                     # --- FINAL: post-game result, once per player per game ---
                     final_key = f"npb_{date_str}_final_{game_id}_{player_name}"
+                    live_key = f"npb_{date_str}_live_{game_id}_{player_name}"
+                    # 漏推偵測:final 時若沒推過 live → 標記並補警示
+                    is_missed_live = live_key not in state
+                    if is_missed_live:
+                        state[live_key] = "final_only"
                     if final_key not in state:
-                        msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b>\n"
+                        if is_missed_live:
+                            msg = (f"\u26a0\ufe0f <b>[NPB {league_label} 比賽結果 — 系統補推]</b>\n"
+                                   f"<i>此球員從未在 live 階段被推播,中段過程可能因系統空白漏掉</i>\n"
+                                   f"\U0001f4ca 完整本場紀錄:\n")
+                        else:
+                            msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b>\n"
                         if game_title:
                             msg += f"\U0001f3df {game_title}\n"
                         msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 出場！\n"
@@ -764,7 +812,8 @@ def _check_npb_league(state, league, league_label):
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
                         notifs.append(msg)
                         state[final_key] = True
-                        log(f"NPB {league_label}: {player_name} FINAL in game {game_id}")
+                        tag = "FINAL (missed-live)" if is_missed_live else "FINAL"
+                        log(f"NPB {league_label}: {player_name} {tag} in game {game_id}")
                     else:
                         log(f"    SKIP (final key exists): {final_key}")
             elif not is_finished and has_lineup:
@@ -988,27 +1037,34 @@ def main():
     # 必須在 _tracked_teams_have_games 之前,因為動態名單會影響「今天哪些隊在打」的判斷
     discover_asian_players(state)
 
-    last_run = state.get("_last_run_ts", 0)
-    now_ts = datetime.now(timezone.utc).timestamp()
-    elapsed = now_ts - last_run
-
-    # Dynamic frequency: 1min when tracked players' TEAMS have games, 10min otherwise
+    # ⭐ 自我健檢 + 動態 polling interval(2026-04-29 重寫)
+    # 雲端 long-running run 透過 yaml bash loop 每 N 秒呼叫一次,
+    # N 由本程式寫進 state["_next_poll_interval"](有比賽 120s,沒比賽 600s)。
+    # 移除舊的「沒比賽 10 分鐘 elapsed early return」邏輯,改由 polling 間隔本身控制頻率。
     teams_playing = _tracked_teams_have_games(state)
-    if teams_playing:
-        # Tracked teams have games today - run every time (1min with cron)
-        log(f"Tracked team(s) playing today, running (elapsed: {int(elapsed)}s)")
-    elif elapsed < 600:
-        # No tracked team games - only check every 10 minutes
-        log(f"No tracked team games today, last run {int(elapsed)}s ago, skipping (10min interval)")
-        save_state(state)  # 即使早返也要存,免得 discovery 結果丟失
-        signal.alarm(0)
-        watchdog.cancel()
-        log("=" * 40)
-        return
-    else:
-        log(f"No tracked team games today, {int(elapsed)}s elapsed, running discovery check")
+    expected_interval = 120 if teams_playing else 600
 
-    state["_last_run_ts"] = now_ts
+    last_ok_ts = state.get("_last_ok_ts", 0)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    gap_s = int(now_ts - last_ok_ts) if last_ok_ts else 0
+
+    # Gap 超過預期 3 倍 = 系統真的失聯,推一條警告讓使用者知道剛才有空白
+    if last_ok_ts > 0 and gap_s > expected_interval * 3:
+        gap_min = gap_s // 60
+        alert_msg = (
+            f"\u26a0\ufe0f <b>[系統健檢]</b>\n"
+            f"上次成功執行距現在 <b>{gap_min} 分鐘</b>,超過預期 {expected_interval//60} 分鐘間隔。\n"
+            f"<i>這段時間可能漏推賽中事件,以下若有累積資料會在後續訊息送出。</i>\n"
+            f"\U0001f50d 詳情看 GitHub Actions log"
+        )
+        _send_alert(alert_msg)
+        log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
+    elif last_ok_ts > 0:
+        log(f"Last ok run {gap_s}s ago (expected ~{expected_interval}s, teams_playing={teams_playing})")
+    else:
+        log(f"First run with new health-check schema (no _last_ok_ts yet)")
+
+    log(f"Tracked teams playing today: {teams_playing}")
 
     # 取合併名單(hardcoded MLB_PLAYERS + 動態 discovery 加的)
     all_tracked = get_all_tracked_players(state)
@@ -1039,21 +1095,15 @@ def main():
         else:
             log("Send failed")
 
+    # ⭐ 跑成功 → 寫 _last_ok_ts + _next_poll_interval(yaml bash loop 會讀後者決定下次 sleep)
+    state["_last_ok_ts"] = now_ts
+    state["_next_poll_interval"] = expected_interval
     save_state(state)
     signal.alarm(0)  # 正常結束前關掉 SIGALRM
     watchdog.cancel()  # 正常結束前關掉 watchdog daemon
     log(f"Done! Sent {sent}/{len(all_notifs)} notifications")
+    log(f"Next poll interval: {expected_interval}s ({'2min' if expected_interval==120 else '10min'})")
     log("=" * 40)
 
 if __name__ == "__main__":
-    if "--loop" in sys.argv:
-        import time
-        log("Starting in LOOP mode (60s interval)")
-        while True:
-            try:
-                main()
-            except Exception as e:
-                log(f"Loop error: {e}")
-            time.sleep(60)
-    else:
-        main()
+    main()

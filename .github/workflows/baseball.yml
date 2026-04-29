@@ -37,15 +37,18 @@ jobs:
           restore-keys: |
             baseball-state-
 
-      # 不靠 GHA cron(每 5 分鐘不準),改在 run 內 bash 迴圈每 5 分鐘呼叫一次 notifier
+      # 不靠 GHA cron(每 5 分鐘不準),改在 run 內 bash 迴圈呼叫 notifier
       # 跑 5h45m 然後乾淨退出,留時間給 cache save。下一個 cron 6 小時後接手
+      # polling interval 由 baseball_notifier.py 寫進 state["_next_poll_interval"]:
+      #   有比賽日 → 120s(2 分鐘)
+      #   沒比賽日 → 600s(10 分鐘)
       - name: Polling loop
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          POLL_INTERVAL=300              # 5 分鐘
+          DEFAULT_INTERVAL=120           # 預設 2 分鐘(有比賽);程式跑完會更新 state.json
           LOOP_DURATION=20700            # 5h45m,讓下一輪 cron(7 minute past)接得上
           END=$(( $(date +%s) + LOOP_DURATION ))
           CONSECUTIVE_FAILS=0
@@ -64,12 +67,14 @@ jobs:
               echo "::endgroup::"
               # 只在第一次失敗推 TG(避免連續失敗 spam)
               if [ "$CONSECUTIVE_FAILS" = "1" ]; then
-                MSG=$(printf '⚠️ Baseball Notifier 單輪失敗\nexit code: %s\nlog: %s\n迴圈仍在跑,5 分鐘後會再試' "${EXIT_CODE}" "${RUN_URL}")
+                MSG=$(printf '⚠️ Baseball Notifier 單輪失敗\nexit code: %s\nlog: %s\n迴圈仍在跑,稍後會再試' "${EXIT_CODE}" "${RUN_URL}")
                 curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${MSG}" >/dev/null || true
               fi
             fi
+            # 讀程式寫進 state.json 的下次 polling interval(有比賽 120s / 沒比賽 600s)
+            POLL_INTERVAL=$(python3 -c "import json,sys; sys.stdout.write(str(json.load(open('state.json')).get('_next_poll_interval', $DEFAULT_INTERVAL)))" 2>/dev/null || echo $DEFAULT_INTERVAL)
             ELAPSED=$(( $(date +%s) - START ))
             SLEEP=$(( POLL_INTERVAL - ELAPSED ))
             REMAINING=$(( END - $(date +%s) ))
@@ -78,6 +83,7 @@ jobs:
               echo "Loop ending: remaining ${REMAINING}s < interval ${POLL_INTERVAL}s"
               break
             fi
+            echo "Next iteration in ${SLEEP}s (poll_interval=${POLL_INTERVAL}s, remaining=${REMAINING}s)"
             if [ $SLEEP -gt 0 ]; then
               sleep $SLEEP
             fi
