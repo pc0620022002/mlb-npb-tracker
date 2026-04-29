@@ -915,11 +915,61 @@ def discover_asian_players(state):
     state["_last_discovery_ts"] = now_ts
     log(f"discovery done. dynamic pool size: {len(discovered)} (added {new_count} new)")
 
+    # 順便 refresh hardcoded MLB_PLAYERS 的 currentTeam(處理球員交易換隊的情境)
+    _refresh_hardcoded_team_ids(state, aaa_to_parent)
+
+
+def _refresh_hardcoded_team_ids(state, aaa_to_parent):
+    """每天 discovery 時順便用 batch API 抓 hardcoded MLB_PLAYERS 的最新 currentTeam,
+    寫進 state["_hardcoded_team_overrides"]。get_all_tracked_players() 會用這個 override 過時的 hardcoded org。
+
+    觸發場景:球員交易換 MLB 球隊(例如從 Cubs 交易到 Padres),hardcoded org 過時 →
+    `_tracked_teams_have_games` 用舊 org 判斷 polling 頻率會有 false negative。
+
+    註:升降 3A 不需 override(parent org 不變);NPB 球員換隊不在這裡處理(沒可靠 player API)。
+    """
+    pids = [str(p[1]) for p in MLB_PLAYERS if p[1]]
+    if not pids:
+        state["_hardcoded_team_overrides"] = {}
+        return
+    overrides = {}
+    try:
+        r = _robust_get("https://statsapi.mlb.com/api/v1/people",
+            params={"personIds": ",".join(pids), "hydrate": "currentTeam"}, timeout=10)
+        if not r or r.status_code != 200:
+            log(f"  hardcoded team refresh: API not OK")
+            return
+        # build pid → hardcoded entry map
+        hp_by_pid = {p[1]: p for p in MLB_PLAYERS if p[1]}
+        for p_data in r.json().get("people", []):
+            pid = p_data.get("id")
+            if not pid or pid not in hp_by_pid:
+                continue
+            current_team_id = p_data.get("currentTeam", {}).get("id")
+            if not current_team_id:
+                continue
+            current_org_id = aaa_to_parent.get(current_team_id, current_team_id)
+            hp = hp_by_pid[pid]  # (name, pid, org, origin)
+            if current_org_id != hp[2]:
+                overrides[str(pid)] = current_org_id
+                log(f"  Hardcoded team override: {hp[0]}({pid}) {hp[2]} -> {current_org_id}")
+    except Exception as e:
+        log(f"  hardcoded team refresh err: {e}")
+    state["_hardcoded_team_overrides"] = overrides
+    if overrides:
+        log(f"  hardcoded team refresh: {len(overrides)} player(s) had team changes")
+
 
 def get_all_tracked_players(state):
-    """合併 hardcoded MLB_PLAYERS + 動態名單。Hardcoded 優先(同 pid 不會重複)。"""
+    """合併 hardcoded MLB_PLAYERS + 動態名單。Hardcoded 優先(同 pid 不會重複)。
+    若 _hardcoded_team_overrides 有值,則 hardcoded org 會用 override 替換(處理球員交易)。"""
+    overrides = state.get("_hardcoded_team_overrides", {})
     hardcoded_pids = {p[1] for p in MLB_PLAYERS if p[1]}
-    out = list(MLB_PLAYERS)
+    out = []
+    for entry in MLB_PLAYERS:
+        name, pid, hp_org, origin = entry
+        org = overrides.get(str(pid), hp_org) if pid else hp_org
+        out.append((name, pid, org, origin))
     for pid_str, info in state.get("_dynamic_players", {}).items():
         try:
             pid = int(pid_str)
