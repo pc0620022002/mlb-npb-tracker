@@ -684,13 +684,29 @@ def _check_npb_league(state, league, league_label):
     schedule_url = f"https://baseball.yahoo.co.jp/npb/schedule/{league}/all?date={date_str}"
     schedule_html = _fetch_yahoo(schedule_url)
     if not schedule_html:
-        log(f"NPB {league_label}: failed to fetch schedule")
+        log(f"NPB {league_label}: failed to fetch schedule (整段抓不到)")
+        # 推 TG 警告(每 6 小時最多推 1 條,避免 NPB 持續壞時 spam)
+        last_alert_ts = state.get(f"_npb_schedule_alert_ts_{league}", 0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts - last_alert_ts > 21600:  # 6 小時
+            _send_alert(f"\u26a0\ufe0f <b>[NPB schedule 整段抓不到]</b>\n"
+                        f"{league_label} schedule_url 連續 retry 後仍失敗。\n"
+                        f"<i>NPB 監控可能整段失效,請檢查 Yahoo Japan 是否被 ban / 改版</i>")
+            state[f"_npb_schedule_alert_ts_{league}"] = now_ts
         return notifs
 
     # Extract game IDs from links like /npb/game/2021038671/
     game_ids = list(set(re.findall(r'/npb/game/(\d+)/', schedule_html)))
     if not game_ids:
-        log(f"NPB {league_label}: no games found for {date_str}")
+        log(f"NPB {league_label}: no games found for {date_str} (schedule 抓到但 0 game,可能 Yahoo 改版)")
+        # 跟 schedule 抓不到一樣推警告(可能是 HTML 結構改了)
+        last_alert_ts = state.get(f"_npb_zero_games_alert_ts_{league}", 0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts - last_alert_ts > 21600:
+            _send_alert(f"\u26a0\ufe0f <b>[NPB schedule 解析 0 game]</b>\n"
+                        f"{league_label} schedule HTML 抓到但 regex 找不到 game ID。\n"
+                        f"<i>可能 Yahoo Japan 改版 HTML 結構,regex `/npb/game/(\\d+)/` 需更新</i>")
+            state[f"_npb_zero_games_alert_ts_{league}"] = now_ts
         return notifs
 
     log(f"NPB {league_label}: found {len(game_ids)} games for {date_str}")
@@ -1180,24 +1196,26 @@ def main():
     # 移除舊的「沒比賽 10 分鐘 elapsed early return」邏輯,改由 polling 間隔本身控制頻率。
     teams_playing = _tracked_teams_have_games(state)
     expected_interval = 120 if teams_playing else 600
+    # R 修正:健檢用「上輪寫的 _next_poll_interval」當基準,避免「上輪沒比賽 600s / 這輪有比賽 120s」邊界場景誤警告
+    prev_expected_interval = state.get("_next_poll_interval", expected_interval)
 
     last_ok_ts = state.get("_last_ok_ts", 0)
     now_ts = datetime.now(timezone.utc).timestamp()
     gap_s = int(now_ts - last_ok_ts) if last_ok_ts else 0
 
-    # Gap 超過預期 3 倍 = 系統真的失聯,推一條警告讓使用者知道剛才有空白
-    if last_ok_ts > 0 and gap_s > expected_interval * 3:
+    # Gap 超過上輪預期間隔 3 倍 = 系統真的失聯,推一條警告讓使用者知道剛才有空白
+    if last_ok_ts > 0 and gap_s > prev_expected_interval * 3:
         gap_min = gap_s // 60
         alert_msg = (
             f"\u26a0\ufe0f <b>[系統健檢]</b>\n"
-            f"上次成功執行距現在 <b>{gap_min} 分鐘</b>,超過預期 {expected_interval//60} 分鐘間隔。\n"
+            f"上次成功執行距現在 <b>{gap_min} 分鐘</b>,超過預期 {prev_expected_interval//60} 分鐘間隔。\n"
             f"<i>這段時間可能漏推賽中事件,以下若有累積資料會在後續訊息送出。</i>\n"
             f"\U0001f50d 詳情看 GitHub Actions log"
         )
         _send_alert(alert_msg)
         log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
     elif last_ok_ts > 0:
-        log(f"Last ok run {gap_s}s ago (expected ~{expected_interval}s, teams_playing={teams_playing})")
+        log(f"Last ok run {gap_s}s ago (prev_expected={prev_expected_interval}s, this_round_expected={expected_interval}s, teams_playing={teams_playing})")
     else:
         log(f"First run with new health-check schema (no _last_ok_ts yet)")
 
@@ -1233,12 +1251,38 @@ def main():
         for msg in all_notifs:
             log(f"  suppressed: {msg[:60].replace(chr(10),' ')}...")
     else:
+        # F2 保險:先重試上輪失敗暫存的訊息,避免 Telegram 持續壞時訊息丟失
+        pending = state.get("_pending_send", [])
+        if pending:
+            log(f"Retrying {len(pending)} pending message(s) from previous run")
+            still_pending = []
+            for entry in pending:
+                msg = entry.get("msg", "")
+                if not msg:
+                    continue
+                if send_tg(msg):
+                    sent += 1
+                    log(f"Sent (retry): {msg[:50].replace(chr(10),' ')}...")
+                else:
+                    # 加重試次數;超過 5 次 / 超過 24 小時就丟棄
+                    entry["attempts"] = entry.get("attempts", 0) + 1
+                    enqueued_at = entry.get("ts", now_ts)
+                    age_hours = (now_ts - enqueued_at) / 3600
+                    if entry["attempts"] < 5 and age_hours < 24:
+                        still_pending.append(entry)
+                    else:
+                        log(f"  GIVE UP after {entry['attempts']} attempts / {age_hours:.1f}h: {msg[:50]}")
+            state["_pending_send"] = still_pending
+        # 本輪新訊息
         for msg in all_notifs:
             if send_tg(msg):
                 sent += 1
                 log(f"Sent: {msg[:50].replace(chr(10),' ')}...")
             else:
-                log("Send failed")
+                log("Send failed → enqueue to _pending_send for next-run retry")
+                state.setdefault("_pending_send", []).append({
+                    "msg": msg, "ts": now_ts, "attempts": 1
+                })
 
     # ⭐ 跑成功 → 寫 _last_ok_ts + _next_poll_interval(yaml bash loop 會讀後者決定下次 sleep)
     state["_last_ok_ts"] = now_ts
