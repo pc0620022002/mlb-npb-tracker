@@ -1005,21 +1005,38 @@ def _tracked_teams_have_games(state):
     if _scan_mlb_schedule(11, tracked_aaa_orgs, aaa_to_parent):
         return True
 
-    # --- NPB:JST 11:00-22:30 視為 active 時段(日場 14:00 + 夜場 18:00 + 結束 buffer) ---
-    # 還要再 confirm 今天 schedule 真的有追蹤球隊;否則就算現在是 NPB 時段也不需頻繁 polling
+    # --- NPB:從 Yahoo Japan schedule 抓追蹤球隊那場的開賽時間,計算 wall-clock 視窗 ---
+    # 之前是「JST 11:00-22:30 + 今天有追蹤球隊」(粒度太粗,整 11.5 小時都會升 2 分鐘)
+    # 改成跟 MLB / 3A 一樣的「該場 game 開賽前 90min ~ 開賽後 4h30m」
     jst = timezone(timedelta(hours=9))
     now_jst = now.astimezone(jst)
-    in_npb_hours = 11 <= now_jst.hour < 23
-    if in_npb_hours:
-        npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
-        try:
-            jst_date_str = now_jst.strftime("%Y-%m-%d")
-            html = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jst_date_str}")
-            if html and any(team in html for team in npb_tracked_teams):
-                log(f"  ACTIVE NPB: JST {now_jst.strftime('%H:%M')} in 11-23h window with tracked team game today")
-                return True
-        except Exception as e:
-            log(f"  NPB schedule err: {e}")
+    npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
+    try:
+        jst_date_str = now_jst.strftime("%Y-%m-%d")
+        html = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jst_date_str}")
+        if html:
+            items = re.findall(r'<li class="bb-score__item.*?</li>', html, re.DOTALL)
+            for item in items:
+                # 開賽時間 from <time class="bb-score__status">HH:MM</time>
+                time_m = re.search(r'<time[^>]*bb-score__status[^>]*>([0-9]{1,2}:[0-9]{2})', item)
+                if not time_m:
+                    continue
+                # 球隊名 from home/awayLogo class
+                team_names = re.findall(r'<p class="bb-score__(?:home|away)Logo[^"]*">([^<]+)</p>', item)
+                if not any(t in team_names for t in npb_tracked_teams):
+                    continue
+                try:
+                    game_dt_jst = datetime.strptime(
+                        f"{jst_date_str} {time_m.group(1)}", "%Y-%m-%d %H:%M"
+                    ).replace(tzinfo=jst)
+                    game_dt_utc = game_dt_jst.astimezone(timezone.utc)
+                    if game_dt_utc - window_before <= now <= game_dt_utc + window_after:
+                        log(f"  ACTIVE NPB: tracked team game at JST {time_m.group(1)} ({'/'.join(team_names)})")
+                        return True
+                except Exception as e:
+                    log(f"  NPB time parse err: {e}")
+    except Exception as e:
+        log(f"  NPB schedule err: {e}")
 
     log(f"  no tracked game in active window now (UTC {now.strftime('%H:%M')}, JST {now_jst.strftime('%H:%M')})")
     return False
