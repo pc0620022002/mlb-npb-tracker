@@ -64,10 +64,7 @@ jobs:
               echo "::endgroup::"
               # 只在第一次失敗推 TG(避免連續失敗 spam)
               if [ "$CONSECUTIVE_FAILS" = "1" ]; then
-                MSG="⚠️ Baseball Notifier 單輪失敗
-exit code: ${EXIT_CODE}
-log: ${RUN_URL}
-迴圈仍在跑,5 分鐘後會再試"
+                MSG=$(printf '⚠️ Baseball Notifier 單輪失敗\nexit code: %s\nlog: %s\n迴圈仍在跑,5 分鐘後會再試' "${EXIT_CODE}" "${RUN_URL}")
                 curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${MSG}" >/dev/null || true
@@ -102,11 +99,7 @@ log: ${RUN_URL}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          MSG="🚨 Baseball Notifier workflow 整段失敗(非單輪失敗)
-run id: ${{ github.run_id }}
-時間: $(date -u +'%Y-%m-%d %H:%M UTC')
-詳細 log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-請手動檢查並重新觸發 workflow"
+          MSG=$(printf '🚨 Baseball Notifier workflow 整段失敗(非單輪失敗)\nrun id: %s\n時間: %s\n詳細 log: https://github.com/%s/actions/runs/%s\n請手動檢查並重新觸發 workflow' "${{ github.run_id }}" "$(date -u +'%Y-%m-%d %H:%M UTC')" "${{ github.repository }}" "${{ github.run_id }}")
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
             --data-urlencode "text=${MSG}" >/dev/null || true
