@@ -179,6 +179,30 @@ def _send_alert(msg):
         log(f"Alert err: {e}")
         return False
 
+def _maybe_send_daily_heartbeat(state):
+    """每天台灣時間 9:00 後若還沒推今天心跳 → 推一條「✅ 系統運作正常」。
+    用途:讓 user 主動知道系統活著。**沒收到心跳 = 系統壞掉**,從被動發現變主動偵測。
+    這是整個系統最後一道 meta 保險,所有其他保險都靠 GHA log 偵錯,只有心跳會主動告知 user。"""
+    tw = timezone(timedelta(hours=8))
+    now_tw = datetime.now(tw)
+    today_str = now_tw.strftime("%Y-%m-%d")
+    if now_tw.hour < 9:
+        return
+    if state.get("_heartbeat_last_date") == today_str:
+        return
+    last_ok = state.get("_last_ok_ts", 0)
+    last_ok_min = int((datetime.now(timezone.utc).timestamp() - last_ok) / 60) if last_ok else -1
+    pending_count = len(state.get("_pending_send", []))
+    msg = (
+        f"✅ <b>Baseball Notifier 心跳</b> {now_tw.strftime('%Y-%m-%d %H:%M')}\n"
+        f"系統運作正常,上次成功跑 {last_ok_min} 分鐘前。\n"
+        f"待重發訊息: {pending_count} 條。\n"
+        f"<i>每天此時間推一條。某天沒收到 = 系統可能壞掉,請查 GitHub Actions。</i>"
+    )
+    if send_tg(msg):
+        state["_heartbeat_last_date"] = today_str
+        log(f"Daily heartbeat sent for {today_str}")
+
 def _robust_get(url, retries=2, backoff_seq=(0.5, 2.0), **kwargs):
     """requests.get 包裝,connection / timeout / 5xx 自動 backoff retry。
     4xx 不重試(client 端錯誤,重試也沒用)。
@@ -920,6 +944,7 @@ def discover_asian_players(state):
     hardcoded_pids = {p[1] for p in MLB_PLAYERS if p[1]}
     hardcoded_names = {_norm_name(p[0]) for p in MLB_PLAYERS}
     new_count = 0
+    disc_fail_count = 0
 
     # 預抓 AAA 隊伍 → 母 MLB org id 對照(3A 球員 currentTeam.id 是 3A 隊 id,要轉成母球團)
     aaa_to_parent = {}
@@ -967,13 +992,41 @@ def discover_asian_players(state):
                 log(f"  discovered: {p.get('fullName')} (id={pid}, origin={origin}, org={org}, sport={sport_id})")
         except Exception as e:
             log(f"discovery err sport={sport_id}: {e}")
+            disc_fail_count += 1
+
+    if disc_fail_count >= 2:
+        last_alert = state.get("_discovery_alert_ts", 0)
+        if now_ts - last_alert > 21600:
+            _send_alert("⚠️ <b>[Discovery 整段失敗]</b>\nMLB + 3A 兩個 sport API 都 fail,動態名單可能過時。\n<i>球員交易 / 新球員上來可能無法即時偵測</i>")
+            state["_discovery_alert_ts"] = now_ts
 
     state["_dynamic_players"] = discovered
     state["_last_discovery_ts"] = now_ts
     log(f"discovery done. dynamic pool size: {len(discovered)} (added {new_count} new)")
+    # hardcoded refresh 抽出獨立呼叫(每 6h),不再依附 discovery 24h
 
-    # 順便 refresh hardcoded MLB_PLAYERS 的 currentTeam(處理球員交易換隊的情境)
+
+_HARDCODED_REFRESH_INTERVAL = 21600  # 6 小時
+
+def _maybe_refresh_hardcoded_teams(state):
+    """獨立的 hardcoded teams refresh,6h 一次(比 discovery 的 24h 更快偵測球員交易)。"""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if now_ts - state.get("_last_hardcoded_refresh_ts", 0) < _HARDCODED_REFRESH_INTERVAL:
+        return
+    log("Refreshing hardcoded MLB_PLAYERS team_ids...")
+    aaa_to_parent = {}
+    try:
+        rt = _robust_get("https://statsapi.mlb.com/api/v1/teams",
+            params={"sportId": 11, "season": date.today().year}, timeout=10)
+        if rt and rt.ok:
+            for t in rt.json().get("teams", []):
+                p = t.get("parentOrgId")
+                if p:
+                    aaa_to_parent[t["id"]] = p
+    except Exception as e:
+        log(f"  hardcoded refresh AAA mapping err: {e}")
     _refresh_hardcoded_team_ids(state, aaa_to_parent)
+    state["_last_hardcoded_refresh_ts"] = now_ts
 
 
 def _refresh_hardcoded_team_ids(state, aaa_to_parent):
@@ -1193,6 +1246,8 @@ def main():
     # 自動偵測亞洲球員(每天跑一次,結果寫進 state["_dynamic_players"])
     # 必須在 _tracked_teams_have_games 之前,因為動態名單會影響「今天哪些隊在打」的判斷
     discover_asian_players(state)
+    # hardcoded teams refresh(獨立 6h interval,比 discovery 24h 更快偵測球員交易)
+    _maybe_refresh_hardcoded_teams(state)
 
     # ⭐ Cold-start 偵測:state 為空(沒 _last_ok_ts 也沒 _last_run_ts) → 本輪 suppress 所有 send_tg
     # 用途:第一次部署 / cache 遺失 / state corrupt 救回 — 避免把「今天所有舊事件」當新事件 spam
@@ -1278,7 +1333,7 @@ def main():
                     entry["attempts"] = entry.get("attempts", 0) + 1
                     enqueued_at = entry.get("ts", now_ts)
                     age_hours = (now_ts - enqueued_at) / 3600
-                    if entry["attempts"] < 5 and age_hours < 24:
+                    if entry["attempts"] < 8 and age_hours < 48:
                         still_pending.append(entry)
                     else:
                         log(f"  GIVE UP after {entry['attempts']} attempts / {age_hours:.1f}h: {msg[:50]}")
@@ -1297,6 +1352,11 @@ def main():
     # ⭐ 跑成功 → 寫 _last_ok_ts + _next_poll_interval(yaml bash loop 會讀後者決定下次 sleep)
     state["_last_ok_ts"] = now_ts
     state["_next_poll_interval"] = expected_interval
+
+    # ⭐ 每日心跳(只在 cold_start 之外的正常 run 才推)
+    if not cold_start:
+        _maybe_send_daily_heartbeat(state)
+
     save_state(state)
     signal.alarm(0)  # 正常結束前關掉 SIGALRM
     watchdog.cancel()  # 正常結束前關掉 watchdog daemon
