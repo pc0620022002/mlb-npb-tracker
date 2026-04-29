@@ -931,69 +931,97 @@ def get_all_tracked_players(state):
     return out
 
 
+def _parse_iso_utc(s):
+    """Parse an ISO 8601 string (with optional Z) into a UTC-aware datetime, or None."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def _tracked_teams_have_games(state):
-    """Check if any tracked player's TEAM has a game scheduled today.
-    This ensures we detect substitute players who haven't appeared yet."""
-    today_str = date.today().strftime("%Y-%m-%d")
+    """檢查「現在這個時間點」是否在任何追蹤球隊的比賽活動視窗內。
+    視窗:開賽前 90 分鐘(覆蓋 lineup 公佈)~ 開賽後 4.5 小時(覆蓋 9 局 + 延長 + 結束後 buffer)。
+    回傳 True → polling 該頻繁(2 分鐘);False → 沒比賽附近,polling 改 10 分鐘。
+
+    過往是「今天整天有沒有比賽」(粒度太粗),改成 wall-clock 視窗判斷(2026-04-29)。"""
+    now = datetime.now(timezone.utc)
+    window_before = timedelta(minutes=90)
+    window_after = timedelta(hours=4, minutes=30)
+
     all_players = get_all_tracked_players(state)
     tracked_mlb_orgs = set(p[2] for p in all_players if p[2])
-    # 3A 只看會被推播的國籍(預設台灣);其他國籍球員的 3A 比賽不再列入追蹤
     tracked_aaa_orgs = set(p[2] for p in all_players if p[3] in AAA_PUSH_ORIGINS and p[2])
 
-    # --- MLB (sportId=1): team IDs match org IDs directly ---
-    try:
-        r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
-            params={"sportId": 1, "date": today_str}, timeout=10)
-        if r.ok:
-            for de in r.json().get("dates", []):
-                for g in de.get("games", []):
-                    for side in ["home", "away"]:
-                        tid = g.get("teams", {}).get(side, {}).get("team", {}).get("id")
-                        if tid in tracked_mlb_orgs:
-                            log(f"MLB team playing today: ID {tid}")
-                            return True
-    except Exception as e:
-        log(f"MLB schedule check err: {e}")
+    # 抓今天 + 昨天 schedule(跨日 / 昨晚比賽延長 / buffer)
+    today = date.today()
+    dates_to_check = [(today - timedelta(days=1)).strftime("%Y-%m-%d"),
+                      today.strftime("%Y-%m-%d")]
 
-    # --- AAA (sportId=11): resolve parent org via teams API ---
+    def _scan_mlb_schedule(sport_id, tracked_orgs, aaa_to_parent=None):
+        """Scan a sport schedule, return True if any game is active right now."""
+        for d in dates_to_check:
+            try:
+                r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+                    params={"sportId": sport_id, "date": d}, timeout=10)
+                if not r.ok:
+                    continue
+                for de in r.json().get("dates", []):
+                    for g in de.get("games", []):
+                        game_dt = _parse_iso_utc(g.get("gameDate"))
+                        if not game_dt:
+                            continue
+                        if not (game_dt - window_before <= now <= game_dt + window_after):
+                            continue
+                        for side in ["home", "away"]:
+                            tid = g.get("teams", {}).get(side, {}).get("team", {}).get("id")
+                            org = aaa_to_parent.get(tid, tid) if aaa_to_parent else tid
+                            if org in tracked_orgs:
+                                gp = g.get("gamePk")
+                                log(f"  ACTIVE {('MLB' if sport_id==1 else 'AAA')}: game {gp} starts {game_dt.isoformat()}, org {org}")
+                                return True
+            except Exception as e:
+                log(f"  schedule err sport={sport_id} date={d}: {e}")
+        return False
+
+    # --- MLB ---
+    if _scan_mlb_schedule(1, tracked_mlb_orgs):
+        return True
+
+    # --- 3A:resolve parent org first ---
+    aaa_to_parent = {}
     try:
-        aaa_to_parent = {}
         rt = requests.get("https://statsapi.mlb.com/api/v1/teams",
-            params={"sportId": 11, "season": today_str[:4]}, timeout=10)
+            params={"sportId": 11, "season": str(today.year)}, timeout=10)
         if rt.ok:
             for t in rt.json().get("teams", []):
                 p = t.get("parentOrgId")
                 if p:
                     aaa_to_parent[t["id"]] = p
-
-        r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
-            params={"sportId": 11, "date": today_str}, timeout=10)
-        if r.ok:
-            for de in r.json().get("dates", []):
-                for g in de.get("games", []):
-                    for side in ["home", "away"]:
-                        tid = g.get("teams", {}).get(side, {}).get("team", {}).get("id")
-                        parent = aaa_to_parent.get(tid)
-                        if parent and parent in tracked_aaa_orgs:
-                            log(f"AAA team playing today: ID {tid} (parent org {parent})")
-                            return True
     except Exception as e:
-        log(f"AAA schedule check err: {e}")
+        log(f"  AAA teams resolve err: {e}")
+    if _scan_mlb_schedule(11, tracked_aaa_orgs, aaa_to_parent):
+        return True
 
-    # --- NPB: check Yahoo Japan schedule for tracked team names ---
+    # --- NPB:JST 11:00-22:30 視為 active 時段(日場 14:00 + 夜場 18:00 + 結束 buffer) ---
+    # 還要再 confirm 今天 schedule 真的有追蹤球隊;否則就算現在是 NPB 時段也不需頻繁 polling
     jst = timezone(timedelta(hours=9))
-    jst_date_str = datetime.now(jst).strftime("%Y-%m-%d")
-    npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
-    try:
-        html = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jst_date_str}")
-        if html:
-            for team in npb_tracked_teams:
-                if team in html:
-                    log(f"NPB team playing today: {team}")
-                    return True
-    except Exception as e:
-        log(f"NPB schedule check err: {e}")
+    now_jst = now.astimezone(jst)
+    in_npb_hours = 11 <= now_jst.hour < 23
+    if in_npb_hours:
+        npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
+        try:
+            jst_date_str = now_jst.strftime("%Y-%m-%d")
+            html = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jst_date_str}")
+            if html and any(team in html for team in npb_tracked_teams):
+                log(f"  ACTIVE NPB: JST {now_jst.strftime('%H:%M')} in 11-23h window with tracked team game today")
+                return True
+        except Exception as e:
+            log(f"  NPB schedule err: {e}")
 
+    log(f"  no tracked game in active window now (UTC {now.strftime('%H:%M')}, JST {now_jst.strftime('%H:%M')})")
     return False
 
 def check_npb(state):
