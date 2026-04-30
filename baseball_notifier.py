@@ -171,13 +171,22 @@ def send_tg(msg):
     log(f"TG send FAILED after 3 attempts: {last_err}")
     return False
 
-def _send_alert(msg):
-    """系統層級警告(失聯/漏推),失敗不影響後續。"""
-    try:
-        return send_tg(msg)
-    except Exception as e:
-        log(f"Alert err: {e}")
-        return False
+def _send_alert(msg, state=None):
+    """系統層級警告(失聯/漏推/心跳)。**失敗時若有 state 就 enqueue 到 _pending_send**,
+    確保警告跟一般推播訊息一樣不會被 Telegram 暫時壞掉吃掉(F2 同類保險原來只 cover 球員推播)。
+    state 為 None 時退回原本「失敗就丟」行為(極早期 bootstrap 場景)。"""
+    if send_tg(msg):
+        return True
+    if state is not None:
+        state.setdefault("_pending_send", []).append({
+            "msg": msg,
+            "ts": datetime.now(timezone.utc).timestamp(),
+            "attempts": 1,
+        })
+        log("Alert send failed → enqueued to _pending_send for next-run retry")
+    else:
+        log("Alert send failed (no state for enqueue, message lost)")
+    return False
 
 def _maybe_send_daily_heartbeat(state):
     """每天台灣時間 9:00 後若還沒推今天心跳 → 推一條「✅ 系統運作正常」。
@@ -199,9 +208,10 @@ def _maybe_send_daily_heartbeat(state):
         f"待重發訊息: {pending_count} 條。\n"
         f"<i>每天此時間推一條。某天沒收到 = 系統可能壞掉,請查 GitHub Actions。</i>"
     )
-    if send_tg(msg):
+    if _send_alert(msg, state):
         state["_heartbeat_last_date"] = today_str
         log(f"Daily heartbeat sent for {today_str}")
+    # heartbeat 失敗:state["_heartbeat_last_date"] 不更新 → 下輪會再試;訊息也已 enqueue
 
 def _robust_get(url, retries=2, backoff_seq=(0.5, 2.0), **kwargs):
     """requests.get 包裝,connection / timeout / 5xx 自動 backoff retry。
@@ -724,7 +734,7 @@ def _check_npb_league(state, league, league_label):
         if now_ts - last_alert_ts > 21600:  # 6 小時
             _send_alert(f"\u26a0\ufe0f <b>[NPB schedule 整段抓不到]</b>\n"
                         f"{league_label} schedule_url 連續 retry 後仍失敗。\n"
-                        f"<i>NPB 監控可能整段失效,請檢查 Yahoo Japan 是否被 ban / 改版</i>")
+                        f"<i>NPB 監控可能整段失效,請檢查 Yahoo Japan 是否被 ban / 改版</i>", state)
             state[f"_npb_schedule_alert_ts_{league}"] = now_ts
         return notifs
 
@@ -738,7 +748,7 @@ def _check_npb_league(state, league, league_label):
         if now_ts - last_alert_ts > 21600:
             _send_alert(f"\u26a0\ufe0f <b>[NPB schedule 解析 0 game]</b>\n"
                         f"{league_label} schedule HTML 抓到但 regex 找不到 game ID。\n"
-                        f"<i>可能 Yahoo Japan 改版 HTML 結構,regex `/npb/game/(\\d+)/` 需更新</i>")
+                        f"<i>可能 Yahoo Japan 改版 HTML 結構,regex `/npb/game/(\\d+)/` 需更新</i>", state)
             state[f"_npb_zero_games_alert_ts_{league}"] = now_ts
         return notifs
 
@@ -925,7 +935,7 @@ def _check_npb_league(state, league, league_label):
         if now_ts_alert - last_alert_ts > 21600:
             _send_alert(f"⚠️ <b>[NPB {league_label} 處理被 90s budget 強制截斷]</b>\n"
                         f"已處理 {games_today}/{len(game_ids)} 場,總耗時 {npb_total_secs}s 超過上限。\n"
-                        f"<i>剩餘場次本輪沒檢查,可能漏掉部分 NPB 推播。Yahoo Japan 慢時會發生,持續發生請查 GHA log</i>")
+                        f"<i>剩餘場次本輪沒檢查,可能漏掉部分 NPB 推播。Yahoo Japan 慢時會發生,持續發生請查 GHA log</i>", state)
             state[f"_npb_budget_bail_alert_ts_{league}"] = now_ts_alert
 
     return notifs
@@ -1006,7 +1016,7 @@ def discover_asian_players(state):
     if disc_fail_count >= 2:
         last_alert = state.get("_discovery_alert_ts", 0)
         if now_ts - last_alert > 21600:
-            _send_alert("⚠️ <b>[Discovery 整段失敗]</b>\nMLB + 3A 兩個 sport API 都 fail,動態名單可能過時。\n<i>球員交易 / 新球員上來可能無法即時偵測</i>")
+            _send_alert("⚠️ <b>[Discovery 整段失敗]</b>\nMLB + 3A 兩個 sport API 都 fail,動態名單可能過時。\n<i>球員交易 / 新球員上來可能無法即時偵測</i>", state)
             state["_discovery_alert_ts"] = now_ts
 
     state["_dynamic_players"] = discovered
@@ -1142,14 +1152,21 @@ def _tracked_teams_have_games(state):
                         game_dt = _parse_iso_utc(g.get("gameDate"))
                         if not game_dt:
                             continue
-                        if not (game_dt - window_before <= now <= game_dt + window_after):
+                        # H 修正:status==Live 時強制視為 active(處理延長賽超過 wall-clock 4.5h),
+                        # Final / Preview 時才用 wall-clock 視窗判斷
+                        status = g.get("status",{}).get("abstractGameState","")
+                        if status == "Live":
+                            in_window = True  # Live = 一定 active,不論 wall-clock
+                        else:
+                            in_window = (game_dt - window_before <= now <= game_dt + window_after)
+                        if not in_window:
                             continue
                         for side in ["home", "away"]:
                             tid = g.get("teams", {}).get(side, {}).get("team", {}).get("id")
                             org = aaa_to_parent.get(tid, tid) if aaa_to_parent else tid
                             if org in tracked_orgs:
                                 gp = g.get("gamePk")
-                                log(f"  ACTIVE {('MLB' if sport_id==1 else 'AAA')}: game {gp} starts {game_dt.isoformat()}, org {org}")
+                                log(f"  ACTIVE {('MLB' if sport_id==1 else 'AAA')}: game {gp} status={status} starts {game_dt.isoformat()}, org {org}")
                                 return True
             except Exception as e:
                 log(f"  schedule err sport={sport_id} date={d}: {e}")
@@ -1286,7 +1303,7 @@ def main():
             f"<i>這段時間可能漏推賽中事件,以下若有累積資料會在後續訊息送出。</i>\n"
             f"\U0001f50d 詳情看 GitHub Actions log"
         )
-        _send_alert(alert_msg)
+        _send_alert(alert_msg, state)
         log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
     elif last_ok_ts > 0:
         log(f"Last ok run {gap_s}s ago (prev_expected={prev_expected_interval}s, this_round_expected={expected_interval}s, teams_playing={teams_playing})")
