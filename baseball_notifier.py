@@ -667,16 +667,18 @@ def _extract_npb_at_bats(html, search_patterns):
     Returns a list of (result_str, has_point: bool) tuples in order.
     """
     for pattern in search_patterns:
-        idx = html.find(pattern)
-        if idx < 0:
+        escaped = re.escape(pattern)
+        # 錨定到打擊成績那一列:名字 </a></td> 之後接 12 個只含數字/空白/小數點的 stat cell。
+        # 這層錨點避免被 HTML 中其他「林 安可」字串匹配到(代打公告、出場名單變更、JS
+        # 內嵌資料、其他 section),這些非 stats 列的 cell 結構不符合「12 個純數字 td」。
+        row_re = (escaped + r'</a>\s*</td>'
+                  + r'(?:\s*<td[^>]*>\s*[\.\d-]*\s*</td>){12}'
+                  + r'(.*?)</tr>')
+        m = re.search(row_re, html, re.DOTALL)
+        if not m:
             continue
-        row_end = html.find("</tr>", idx)
-        if row_end < 0:
-            continue
-        row = html[idx:row_end]
-        tds = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row)
-        # 從 stat cells 之後一路取到 row 結束,涵蓋延長賽多出來的 inning 欄位。
-        inning_cells = tds[12:]
+        inning_html = m.group(1)
+        inning_cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', inning_html)
         results = []
         for cell in inning_cells:
             m = re.search(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell)
