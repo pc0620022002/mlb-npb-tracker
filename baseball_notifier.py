@@ -733,13 +733,28 @@ def _check_npb_league(state, league, league_label):
     # Use JST (UTC+9) for Japan date
     jst = timezone(timedelta(hours=9))
     now_jst = datetime.now(jst)
-    date_str = now_jst.strftime("%Y-%m-%d")
+    today_str = now_jst.strftime("%Y-%m-%d")
+    yesterday_str = (now_jst - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Fetch schedule page
-    schedule_url = f"https://baseball.yahoo.co.jp/npb/schedule/{league}/all?date={date_str}"
-    schedule_html = _fetch_yahoo(schedule_url)
-    if not schedule_html:
-        log(f"NPB {league_label}: failed to fetch schedule (整段抓不到)")
+    # MLB / 3A 路徑同時查 today + yesterday(line 401-402),NPB 之前只查 today。若 NPB
+    # 比賽因延長 + 雨延後等罕見場景跨午夜才結束,該場 final 推播會被漏掉(隔天 date_str 變
+    # 新日期,game_date != date_str → skip)。修法:JST 0-3 時也查昨天 schedule,合併
+    # game_ids,並把昨天加入 acceptable_dates 讓 game_date 比對通過。dedup key 改用
+    # game_date(從 title 抓)而非 date_str,確保跨日 live → final 用相同日期 key 連續。
+    if now_jst.hour < 4:
+        dates_to_query = [yesterday_str, today_str]
+    else:
+        dates_to_query = [today_str]
+    acceptable_dates = set(dates_to_query)
+    date_str = today_str  # 保留 log 相容
+
+    # Fetch schedule page(s) — 跨日 backstop 同時查多個日期
+    schedule_results = []
+    for d in dates_to_query:
+        url = f"https://baseball.yahoo.co.jp/npb/schedule/{league}/all?date={d}"
+        schedule_results.append((d, _fetch_yahoo(url)))
+    if all(h is None for _, h in schedule_results):
+        log(f"NPB {league_label}: failed to fetch schedule for all dates {dates_to_query} (整段抓不到)")
         # 推 TG 警告(每 6 小時最多推 1 條,避免 NPB 持續壞時 spam)
         last_alert_ts = state.get(f"_npb_schedule_alert_ts_{league}", 0)
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -750,10 +765,14 @@ def _check_npb_league(state, league, league_label):
             state[f"_npb_schedule_alert_ts_{league}"] = now_ts
         return notifs
 
-    # Extract game IDs from links like /npb/game/2021038671/
-    game_ids = list(set(re.findall(r'/npb/game/(\d+)/', schedule_html)))
+    # 從成功 fetch 的 schedule 合併 game IDs(跨日 backstop:可能含昨天場次)
+    game_ids_set = set()
+    for d, h in schedule_results:
+        if h:
+            game_ids_set.update(re.findall(r'/npb/game/(\d+)/', h))
+    game_ids = list(game_ids_set)
     if not game_ids:
-        log(f"NPB {league_label}: no games found for {date_str} (schedule 抓到但 0 game,可能 Yahoo 改版)")
+        log(f"NPB {league_label}: no games found for dates {dates_to_query} (schedule 抓到但 0 game,可能 Yahoo 改版)")
         # 跟 schedule 抓不到一樣推警告(可能是 HTML 結構改了)
         last_alert_ts = state.get(f"_npb_zero_games_alert_ts_{league}", 0)
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -764,7 +783,7 @@ def _check_npb_league(state, league, league_label):
             state[f"_npb_zero_games_alert_ts_{league}"] = now_ts
         return notifs
 
-    log(f"NPB {league_label}: found {len(game_ids)} games for {date_str}")
+    log(f"NPB {league_label}: found {len(game_ids)} games for dates {dates_to_query}")
 
     # Debug: show existing NPB state keys
     npb_keys = [k for k in state if k.startswith("npb_")]
@@ -812,8 +831,8 @@ def _check_npb_league(state, league, league_label):
             log(f"  game {game_id}: no date in title, skipping")
             continue
         game_date = f"{date_in_title.group(1)}-{int(date_in_title.group(2)):02d}-{int(date_in_title.group(3)):02d}"
-        if game_date != date_str:
-            log(f"  game {game_id}: date {game_date} != today {date_str}, skipping")
+        if game_date not in acceptable_dates:
+            log(f"  game {game_id}: date {game_date} not in acceptable {acceptable_dates}, skipping")
             continue
         game_title = raw_title.replace(" - プロ野球 - スポーツナビ", "").strip()
         game_title = re.sub(r'\s*試合(出場成績|速報)\s*', '', game_title)
@@ -877,7 +896,9 @@ def _check_npb_league(state, league, league_label):
 
                 if not is_finished:
                     # --- MID-GAME: live update whenever stat line changes ---
-                    live_key = f"npb_{date_str}_live_{game_id}_{player_name}"
+                    # dedup key 用 game_date(從 title 抓的比賽日期),不是 date_str(今天 JST 日期),
+                    # 確保跨午夜延長賽的 live → final 用相同日期 key 連續(避免重複推或漏推)
+                    live_key = f"npb_{game_date}_live_{game_id}_{player_name}"
                     prev_snap = state.get(live_key)
                     if prev_snap != full_stat:
                         tag = "賽中更新" if prev_snap else "賽中出場"
@@ -894,8 +915,9 @@ def _check_npb_league(state, league, league_label):
                         log(f"    SKIP (stats unchanged): {live_key}")
                 else:
                     # --- FINAL: post-game result, once per player per game ---
-                    final_key = f"npb_{date_str}_final_{game_id}_{player_name}"
-                    live_key = f"npb_{date_str}_live_{game_id}_{player_name}"
+                    # 跟 live_key 一樣用 game_date,確保跨午夜場次的 live → final 連續
+                    final_key = f"npb_{game_date}_final_{game_id}_{player_name}"
+                    live_key = f"npb_{game_date}_live_{game_id}_{player_name}"
                     # 漏推偵測:final 時若沒推過 live → 標記並補警示
                     is_missed_live = live_key not in state
                     if is_missed_live:
@@ -923,7 +945,8 @@ def _check_npb_league(state, league, league_label):
                 games_with_lineup_checked += 1
                 lineup_type = _extract_npb_lineup(top_html, pinfo["search"])
                 if lineup_type:
-                    lineup_key = f"npb_{date_str}_lineup_{game_id}_{player_name}"
+                    # 跟 live/final key 一樣用 game_date(跨日連續性)
+                    lineup_key = f"npb_{game_date}_lineup_{game_id}_{player_name}"
                     if lineup_key not in state:
                         msg = f"\u26be <b>[NPB {league_label} 先發名單]</b>\n"
                         if game_title:
@@ -1215,10 +1238,18 @@ def _tracked_teams_have_games(state):
     now_jst = now.astimezone(jst)
     npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
     try:
+        # 跨日 backstop:JST 0-3 時也查昨天 schedule,catch 跨午夜還在打的延長賽
         jst_date_str = now_jst.strftime("%Y-%m-%d")
-        html = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jst_date_str}")
-        if html:
-            items = re.findall(r'<li class="bb-score__item.*?</li>', html, re.DOTALL)
+        if now_jst.hour < 4:
+            jst_dates = [(now_jst - timedelta(days=1)).strftime("%Y-%m-%d"), jst_date_str]
+        else:
+            jst_dates = [jst_date_str]
+        items = []
+        for jd in jst_dates:
+            h = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/schedule/first/all?date={jd}")
+            if h:
+                items.extend(re.findall(r'<li class="bb-score__item.*?</li>', h, re.DOTALL))
+        if items:
             for item in items:
                 team_names = re.findall(r'<p class="bb-score__(?:home|away)Logo[^"]*">([^<]+)</p>', item)
                 if not any(t in team_names for t in npb_tracked_teams):
