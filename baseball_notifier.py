@@ -68,7 +68,7 @@ MLB_PLAYERS = [
 ]
 
 # 哪些 origin 的球員在 3A 比賽要推播。其他國籍只推播 MLB。
-AAA_PUSH_ORIGINS = {"tw"}
+AAA_PUSH_ORIGINS = {"tw", "us"}
 
 # 自動偵測排除名單:即使 birthCountry 符合 jp/kr/tw,也不要納入動態追蹤。
 # 用途:有些日裔/韓裔球員是在亞洲出生但生涯都在美國,跟使用者關心的「旅美亞洲球員」概念不同。
@@ -395,7 +395,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
         try:
             r = _robust_get("https://statsapi.mlb.com/api/v1/schedule",
                 params={"sportId": sport_id, "date": check_date,
-                        "hydrate": "lineups,team,probablePitcher,score"}, timeout=15)
+                        "hydrate": "lineups,team,probablePitcher,linescore"}, timeout=15)
             if r is None or not r.ok:
                 continue  # _robust_get 已經 retry 過,放棄這個 date 進下一輪
             data = r.json()
@@ -410,8 +410,17 @@ def check_schedule(sport_id, prefix, label, state, players=None):
             abst = g.get("status",{}).get("abstractGameState","")
             home = g.get("teams",{}).get("home",{}).get("team",{}).get("name","")
             away = g.get("teams",{}).get("away",{}).get("team",{}).get("name","")
-            hs = g.get("teams",{}).get("home",{}).get("score",0)
-            aws = g.get("teams",{}).get("away",{}).get("score",0)
+            # 比分優先從 linescore.teams.{home,away}.runs 拿(canonical 即時比分),
+            # fallback 到 teams.{home,away}.score。
+            # 原因:hydrate=score 對 Live 狀態的 AAA game 會 missing(實測 Reno Aces 04-29 場
+            # team.score=null),程式 fallback 0 → 推播訊息顯示 0-0 比分錯。linescore 兩邊都可靠。
+            ls_teams = (g.get("linescore") or {}).get("teams", {})
+            hs = ls_teams.get("home", {}).get("runs")
+            aws = ls_teams.get("away", {}).get("runs")
+            if hs is None:
+                hs = g.get("teams",{}).get("home",{}).get("score", 0)
+            if aws is None:
+                aws = g.get("teams",{}).get("away",{}).get("score", 0)
             gt = g.get("gameDate","")
             matchup = f"{away} vs {home}"
 
