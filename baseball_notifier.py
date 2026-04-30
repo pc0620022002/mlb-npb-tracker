@@ -1191,9 +1191,14 @@ def _tracked_teams_have_games(state):
     if _scan_mlb_schedule(11, tracked_aaa_orgs, aaa_to_parent):
         return True
 
-    # --- NPB:從 Yahoo Japan schedule 抓追蹤球隊那場的開賽時間,計算 wall-clock 視窗 ---
-    # 之前是「JST 11:00-22:30 + 今天有追蹤球隊」(粒度太粗,整 11.5 小時都會升 2 分鐘)
-    # 改成跟 MLB / 3A 一樣的「該場 game 開賽前 90min ~ 開賽後 4h30m」
+    # --- NPB:從 Yahoo Japan schedule 抓追蹤球隊的場次狀態 ---
+    # 兩道判斷(對應 MLB/AAA 的 status==Live 強制 + wall-clock 視窗):
+    #   1. <li class="bb-score__item--live"> → 比賽進行中,直接 ACTIVE(這條是 2026-04-30 修補)
+    #      理由:Yahoo 比賽開始後會把 <time bb-score__status>HH:MM</time> 整段拿掉,
+    #      只用 wall-clock 抓不到開賽時間 → 永遠 false → polling 卡 600s。
+    #      跟 commit 7896e94 在 MLB/AAA 加的 `status==Live → in_window=True` 是同類保險。
+    #   2. preview(賽前)仍有 <time bb-score__status>HH:MM</time> → 用 wall-clock 視窗
+    #      (開賽前 90min ~ 開賽後 4h30m,跟 MLB/AAA 一致)
     jst = timezone(timedelta(hours=9))
     now_jst = now.astimezone(jst)
     npb_tracked_teams = set(info["team"] for info in NPB_PLAYERS_INFO.values())
@@ -1203,13 +1208,17 @@ def _tracked_teams_have_games(state):
         if html:
             items = re.findall(r'<li class="bb-score__item.*?</li>', html, re.DOTALL)
             for item in items:
-                # 開賽時間 from <time class="bb-score__status">HH:MM</time>
-                time_m = re.search(r'<time[^>]*bb-score__status[^>]*>([0-9]{1,2}:[0-9]{2})', item)
-                if not time_m:
-                    continue
-                # 球隊名 from home/awayLogo class
                 team_names = re.findall(r'<p class="bb-score__(?:home|away)Logo[^"]*">([^<]+)</p>', item)
                 if not any(t in team_names for t in npb_tracked_teams):
+                    continue
+                # 1. Live 強制 ACTIVE — 不靠 wall-clock(該 tag 在 live 期間消失)
+                header = item.split(">", 1)[0]
+                if "bb-score__item--live" in header:
+                    log(f"  ACTIVE NPB: tracked team game LIVE ({'/'.join(team_names)})")
+                    return True
+                # 2. preview / scheduled — 仍走 wall-clock 視窗
+                time_m = re.search(r'<time[^>]*bb-score__status[^>]*>([0-9]{1,2}:[0-9]{2})', item)
+                if not time_m:
                     continue
                 try:
                     game_dt_jst = datetime.strptime(
