@@ -1290,6 +1290,19 @@ def main():
         if stale_keys:
             log(f"Cleared {len(stale_keys)} stale NPB state keys for {today_jst} (fix v3)")
 
+    # 2026-04-30 一次性修補:林安可 西武vs日本ハム 11 局延長賽因 _extract_npb_at_bats
+    # 切片 bug,9:04 PM 比賽結果訊息顯示截斷的 2 個打席(實際 3 個:遊飛/右飛/左飛)。
+    # 修法已在 fb9d7d1 + 5c2263d push,但 GHA long-running run 用啟動時的舊 code,
+    # 此清理刪掉該場 final dedup 旗標,讓 NPB 段重推一次正確版本(此版仍由 newrun 跑新 code)。
+    # 執行一次後 _correction_lin_extra_inning 寫進 state,不會重複觸發。
+    if not state.get("_correction_lin_extra_inning"):
+        bad_final_key = "npb_2026-04-30_final_2021038791_林安可"
+        if bad_final_key in state:
+            del state[bad_final_key]
+            log(f"One-off correction: removed {bad_final_key} → NPB iteration will re-push corrected final")
+        state["_correction_lin_extra_inning"] = True
+        save_state(state)
+
     # 自動偵測亞洲球員(每天跑一次,結果寫進 state["_dynamic_players"])
     # 必須在 _tracked_teams_have_games 之前,因為動態名單會影響「今天哪些隊在打」的判斷
     discover_asian_players(state)
