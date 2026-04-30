@@ -421,16 +421,23 @@ def check_schedule(sport_id, prefix, label, state, players=None):
             home = g.get("teams",{}).get("home",{}).get("team",{}).get("name","")
             away = g.get("teams",{}).get("away",{}).get("team",{}).get("name","")
             # 比分優先從 linescore.teams.{home,away}.runs 拿(canonical 即時比分),
-            # fallback 到 teams.{home,away}.score。
-            # 原因:hydrate=score 對 Live 狀態的 AAA game 會 missing(實測 Reno Aces 04-29 場
-            # team.score=null),程式 fallback 0 → 推播訊息顯示 0-0 比分錯。linescore 兩邊都可靠。
+            # fallback 到 teams.{home,away}.score,兩個都拿不到顯示 "?"。
+            # 原因:hydrate=score 對 Live 狀態 AAA game 會 missing(實測 Reno Aces 04-29 場
+            # team.score=null) → 推播訊息顯示 0-0 比分錯。f91e39c 用 linescore 修了主路徑,
+            # 但 fallback 仍 `.get("score", 0)` — Python `.get(key, default)` 只在 key 缺失時用
+            # default,**key 存在但 value=None 時仍回 None**;若兩個來源都 None 訊息會印 "None - None"。
+            # 2026-04-30 audit:統一兩段都用 "value is None → 繼續 fallback" 處理,最後 None 顯示 "?"。
             ls_teams = (g.get("linescore") or {}).get("teams", {})
             hs = ls_teams.get("home", {}).get("runs")
-            aws = ls_teams.get("away", {}).get("runs")
             if hs is None:
-                hs = g.get("teams",{}).get("home",{}).get("score", 0)
+                hs = g.get("teams", {}).get("home", {}).get("score")
+            if hs is None:
+                hs = "?"
+            aws = ls_teams.get("away", {}).get("runs")
             if aws is None:
-                aws = g.get("teams",{}).get("away",{}).get("score", 0)
+                aws = g.get("teams", {}).get("away", {}).get("score")
+            if aws is None:
+                aws = "?"
             gt = g.get("gameDate","")
             matchup = f"{away} vs {home}"
 
