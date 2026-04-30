@@ -656,11 +656,14 @@ def _extract_npb_pitching(html, search_patterns):
 
 def _extract_npb_at_bats(html, search_patterns):
     """Extract per-inning at-bat results for a batter from Yahoo Japan stats HTML.
-    Each batter row has 12 stat cells + 9 inning cells (innings 1-9), where inning cells
-    may contain <div class="bb-statsTable__dataDetail">result</div> text like:
+    Each batter row has 12 stat cells + N inning cells (N=9 normally, more for 延長戦),
+    where inning cells may contain <div class="bb-statsTable__dataDetail">result</div>
+    text like:
         右安 (right single), 左2 (left double), 中本 (center HR),
         空三振 (swinging K), 見三振 (called K), 四球, 投ゴロ, ... etc.
     打點打席會額外加上 class bb-statsTable__dataDetail--point。
+    延長賽會在 inning 欄位右側增加新 cell(10/11/12 局),所以不能寫死「最後 9 cells」,
+    一律取 stat cells 之後的所有 cells。
     Returns a list of (result_str, has_point: bool) tuples in order.
     """
     for pattern in search_patterns:
@@ -672,8 +675,8 @@ def _extract_npb_at_bats(html, search_patterns):
             continue
         row = html[idx:row_end]
         tds = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row)
-        # After name link cell, 12 stat cells + 9 inning cells. Take last 9.
-        inning_cells = tds[-9:] if len(tds) >= 21 else tds[12:]
+        # 從 stat cells 之後一路取到 row 結束,涵蓋延長賽多出來的 inning 欄位。
+        inning_cells = tds[12:]
         results = []
         for cell in inning_cells:
             m = re.search(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell)
