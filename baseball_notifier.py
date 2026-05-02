@@ -722,6 +722,31 @@ def _extract_npb_lineup(html, search_patterns):
         return "batter"
     return None
 
+def _extract_npb_score(top_html):
+    """從 Yahoo Japan /top 頁面抓出兩隊隊名與比分。
+    Markup 順序(實測 finished 場 2026-04-28 / 05-02 多場確認):
+      <div class="bb-gameTeam"> ... <span class="bb-gameTeam__name">{home}</span> ...
+      <div class="bb-gameTeam__score">
+        <span class="bb-gameTeam__homeScore">{home_score}</span>
+        <span class="bb-gameTeam__awayScore">{away_score}</span>
+      <div class="bb-gameTeam"> ... <span class="bb-gameTeam__name">{away}</span> ...
+    回傳 (away_name, away_score, home_name, home_score),對齊 MLB/3A 比分顯示順序
+    「客 X - Y 主」。任何欄位抓不到回傳 None,呼叫端決定要不要顯示比分行。
+    賽前(試合前)沒 score markup,會回 None — 這正好對應「賽前不需要顯示比分」。
+    """
+    home_score_m = re.search(r'class="bb-gameTeam__homeScore">([^<]*)</span>', top_html)
+    away_score_m = re.search(r'class="bb-gameTeam__awayScore">([^<]*)</span>', top_html)
+    if not home_score_m or not away_score_m:
+        return None
+    home_score = home_score_m.group(1).strip()
+    away_score = away_score_m.group(1).strip()
+    if not home_score or not away_score:
+        return None
+    name_matches = re.findall(r'class="bb-gameTeam__name">([^<]+)</span>', top_html)
+    home_name = name_matches[0].strip() if len(name_matches) >= 1 else "?"
+    away_name = name_matches[1].strip() if len(name_matches) >= 2 else "?"
+    return away_name, away_score, home_name, home_score
+
 def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
@@ -850,6 +875,9 @@ def _check_npb_league(state, league, league_label):
 
         log(f"  game {game_id}: {game_title} finished={is_finished} has_lineup={has_lineup}")
 
+        # 場中/賽後比分(對齊 MLB/3A 推播格式)。賽前無 score markup → 回 None。
+        score_info = _extract_npb_score(top_html)
+
         # Fetch stats page (contains per-player batting/pitching tables)
         stats_url = f"https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
         stats_html = _fetch_yahoo(stats_url)
@@ -905,6 +933,9 @@ def _check_npb_league(state, league, league_label):
                         msg = f"\u26be <b>[NPB {league_label} {tag}]</b>\n"
                         if game_title:
                             msg += f"\U0001f3df {game_title}\n"
+                        if score_info:
+                            aw_n, aw_s, hm_n, hm_s = score_info
+                            msg += f"\U0001f4ca {aw_n} {aw_s} - {hm_s} {hm_n}\n"
                         msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 已上場！\n"
                         msg += f"{full_stat}\n"
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
@@ -931,6 +962,9 @@ def _check_npb_league(state, league, league_label):
                             msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b>\n"
                         if game_title:
                             msg += f"\U0001f3df {game_title}\n"
+                        if score_info:
+                            aw_n, aw_s, hm_n, hm_s = score_info
+                            msg += f"\U0001f4ca {aw_n} <b>{aw_s}</b> - <b>{hm_s}</b> {hm_n}\n"
                         msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 出場！\n"
                         msg += f"{full_stat}\n"
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
