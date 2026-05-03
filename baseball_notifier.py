@@ -499,6 +499,14 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                     prev_snap = state.get(live_key)
 
                                     if prev_snap != current_snap:
+                                        # Race防護:MLB Stats API 的 boxscore 跟 playByPlay 是兩個不同 endpoint,
+                                        # 不保證原子一致 — boxscore.atBats 偶爾會比 playByPlay 的 result.event 填寫
+                                        # 早一拍,造成「N 打數但每打席只列 N-1 個」的不對齊推播。發現就 defer
+                                        # 到下一輪 polling(state[live_key] 不更新 → 下輪 snap 仍 differs → 重檢查)。
+                                        ab_list = _get_mlb_at_bats(gp, pid_str) if has_bat else []
+                                        if has_bat and ab > 0 and len(ab_list) < ab:
+                                            log(f"  DEFER live push for {m}: boxscore ab={ab} but pbp has {len(ab_list)} completed events (race)")
+                                            continue
                                         lines = []
                                         # Get season stats from boxscore; fallback to API
                                         season_avg = pv.get("seasonStats", {}).get("batting", {}).get("avg")
@@ -512,7 +520,6 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                                 season_era = fb.get("era")
                                         if has_bat:
                                             lines.append("\U0001f3cf 目前：" + _fmt_batter_stats(bat, season_avg))
-                                            ab_list = _get_mlb_at_bats(gp, pid_str)
                                             ab_block = _fmt_at_bats(ab_list)
                                             if ab_block:
                                                 lines.append(ab_block)
@@ -539,6 +546,17 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                     # 漏推偵測:中段從未推 live → 補一條警示前綴
                                     is_missed_live = state.get(live_key) == "final_only"
                                     if final_key not in state:
+                                        # Race防護(同 live):boxscore.atBats vs playByPlay.result.event 偶爾不對齊。
+                                        # final 是一次性推不能無限延後 → 加 3 次 defer cap,超過就推現有資料避免漏推。
+                                        ab_list = _get_mlb_at_bats(gp, pid_str) if has_bat else []
+                                        if has_bat and ab > 0 and len(ab_list) < ab:
+                                            defer_key = f"{prefix}_{game_date_str}_final_defer_{gp}_{pid_str}"
+                                            defer_count = state.get(defer_key, 0)
+                                            if defer_count < 3:
+                                                state[defer_key] = defer_count + 1
+                                                log(f"  DEFER final push for {m} ({defer_count+1}/3): boxscore ab={ab} but pbp has {len(ab_list)} (race)")
+                                                continue
+                                            log(f"  FORCE final push for {m} despite mismatch: pbp lag exceeded 3 cycles")
                                         lines = []
                                         # Get season stats from boxscore; fallback to API
                                         season_avg = pv.get("seasonStats", {}).get("batting", {}).get("avg")
@@ -567,7 +585,6 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                                     if season_avg and season_avg not in ("-", ".---"):
                                                         zero_ab_line += f" (打率{season_avg})"
                                                     lines.append(zero_ab_line)
-                                            ab_list = _get_mlb_at_bats(gp, pid_str)
                                             ab_block = _fmt_at_bats(ab_list)
                                             if ab_block:
                                                 lines.append(ab_block)
