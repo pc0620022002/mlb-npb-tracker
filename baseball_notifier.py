@@ -547,16 +547,13 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                     is_missed_live = state.get(live_key) == "final_only"
                                     if final_key not in state:
                                         # Race防護(同 live):boxscore.atBats vs playByPlay.result.event 偶爾不對齊。
-                                        # final 是一次性推不能無限延後 → 加 3 次 defer cap,超過就推現有資料避免漏推。
+                                        # 使用者偏好「晚一點推沒關係,但內容要對」→ final 也無限 defer 直到對齊,
+                                        # 不設 cap。極端 MLB API 永久不對齊場景 user 會整場沒收到 final,但比起
+                                        # 推不對齊資料(讓 user 誤以為球員只打 N-1 個打席)更可接受。
                                         ab_list = _get_mlb_at_bats(gp, pid_str) if has_bat else []
                                         if has_bat and ab > 0 and len(ab_list) < ab:
-                                            defer_key = f"{prefix}_{game_date_str}_final_defer_{gp}_{pid_str}"
-                                            defer_count = state.get(defer_key, 0)
-                                            if defer_count < 3:
-                                                state[defer_key] = defer_count + 1
-                                                log(f"  DEFER final push for {m} ({defer_count+1}/3): boxscore ab={ab} but pbp has {len(ab_list)} (race)")
-                                                continue
-                                            log(f"  FORCE final push for {m} despite mismatch: pbp lag exceeded 3 cycles")
+                                            log(f"  DEFER final push for {m}: boxscore ab={ab} but pbp has {len(ab_list)} (race, 無 cap 等到對齊)")
+                                            continue
                                         lines = []
                                         # Get season stats from boxscore; fallback to API
                                         season_avg = pv.get("seasonStats", {}).get("batting", {}).get("avg")
