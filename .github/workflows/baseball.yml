@@ -54,6 +54,10 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          # healthchecks.io dead-man's-switch:每輪成功 ping,失敗 ping /fail。
+          # GHA runner 完全派不到時(2026-05-05 那種),這個 ping 不會發 → healthchecks
+          # 60 分鐘後 email 警告 user。這是「11 層保險全失靈時」的最後一道。
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
         run: |
           DEFAULT_INTERVAL=120           # 預設 2 分鐘(有比賽);程式跑完會更新 state.json
           LOOP_DURATION=19500            # 5h25m,run 內部跑迴圈的總時長
@@ -73,11 +77,19 @@ jobs:
             if python baseball_notifier.py; then
               CONSECUTIVE_FAILS=0
               echo "::endgroup::"
+              # ping healthchecks.io 成功訊號(timeout 5s, fail-silent 不影響主流程)
+              if [ -n "$HEALTHCHECK_URL" ]; then
+                curl -fsS -m 5 --retry 2 -o /dev/null "$HEALTHCHECK_URL" || echo "[WARN] healthcheck ping failed (non-fatal)"
+              fi
             else
               EXIT_CODE=$?
               CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
               echo "[ERR] iteration ${ITERATION} exited ${EXIT_CODE}, consecutive_fails=${CONSECUTIVE_FAILS}"
               echo "::endgroup::"
+              # ping /fail 讓 healthchecks 知道是「跑了但失敗」(跟「整段沒跑」區分)
+              if [ -n "$HEALTHCHECK_URL" ]; then
+                curl -fsS -m 5 --retry 2 -o /dev/null "${HEALTHCHECK_URL}/fail" || echo "[WARN] healthcheck /fail ping failed (non-fatal)"
+              fi
               if [ "$CONSECUTIVE_FAILS" = "1" ]; then
                 MSG=$(printf '⚠️ Baseball Notifier 單輪失敗\nexit code: %s\nlog: %s\n迴圈仍在跑,稍後會再試' "${EXIT_CODE}" "${RUN_URL}")
                 curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
