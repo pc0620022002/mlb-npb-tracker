@@ -765,8 +765,8 @@ def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
     # NPB 段最多花 90 秒(2026-04-28 加,避免 Yahoo Japan 半夜慢時拖垮整個 main)。
-    # schedule 頁面會列出未來一週的 game,每個 game 都要 fetch /top 才知道日期,
-    # 34 場 × 8s timeout 最壞 270s,所以這裡用 budget bail 而非 timeout 累積。
+    # 2026-05-10 起 game_ids 已過濾為「當日場次」,正常情境下 6~12 場 fetch 不會超過 90s;
+    # 此 budget 仍保留作為 Yahoo Japan 嚴重慢時的最後防線(處理一半就 bail 並推 TG 警告)。
     NPB_BUDGET_SECONDS = 90
     npb_start_ts = datetime.now(timezone.utc).timestamp()
     # Use JST (UTC+9) for Japan date
@@ -804,11 +804,17 @@ def _check_npb_league(state, league, league_label):
             state[f"_npb_schedule_alert_ts_{league}"] = now_ts
         return notifs
 
-    # 從成功 fetch 的 schedule 合併 game IDs(跨日 backstop:可能含昨天場次)
+    # 從成功 fetch 的 schedule 合併 game IDs(跨日 backstop:可能含昨天場次)。
+    # 只抓 <section class="bb-score"> 區塊內的 game(該日 セ + パ 的當日比賽列表),
+    # 排除頁面下方「チーム別日程・結果」區塊裡其他日期的歷史 / 預定比賽 — 那些
+    # 會把 game IDs 從 6 場膨脹到 36 場(跨日 backstop 時 12 → 68),後面每個都
+    # 要 fetch /top 驗日期,Yahoo Japan 稍慢就頂破 90s budget。2026-05-10 修。
     game_ids_set = set()
     for d, h in schedule_results:
-        if h:
-            game_ids_set.update(re.findall(r'/npb/game/(\d+)/', h))
+        if not h:
+            continue
+        for sec in re.findall(r'<section[^>]*class="bb-score"[^>]*>(.*?)</section>', h, re.DOTALL):
+            game_ids_set.update(re.findall(r'/npb/game/(\d+)/', sec))
     game_ids = list(game_ids_set)
     if not game_ids:
         log(f"NPB {league_label}: no games found for dates {dates_to_query} (schedule 抓到但 0 game,可能 Yahoo 改版)")
