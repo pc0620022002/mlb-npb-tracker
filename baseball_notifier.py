@@ -817,14 +817,25 @@ def _check_npb_league(state, league, league_label):
             game_ids_set.update(re.findall(r'/npb/game/(\d+)/', sec))
     game_ids = list(game_ids_set)
     if not game_ids:
+        # 區分兩種「0 game」情境(2026-05-11 補):
+        # (1) 休賽日 — NPB 週一常見休賽,Yahoo HTML 用 <p class="bb-noData">試合はありません</p>
+        #     標示,且不會有 <section class="bb-score"> 區塊 → silent 早退,不警告
+        # (2) Yahoo HTML 結構改版 — 兩個跡象都沒有 → 推 TG 警告
+        is_rest_day = any(
+            h and 'bb-noData' in h and '試合はありません' in h
+            for d, h in schedule_results
+        )
+        if is_rest_day:
+            log(f"NPB {league_label}: 休賽日 (Yahoo: 試合はありません),skip 不警告")
+            return notifs
         log(f"NPB {league_label}: no games found for dates {dates_to_query} (schedule 抓到但 0 game,可能 Yahoo 改版)")
         # 跟 schedule 抓不到一樣推警告(可能是 HTML 結構改了)
         last_alert_ts = state.get(f"_npb_zero_games_alert_ts_{league}", 0)
         now_ts = datetime.now(timezone.utc).timestamp()
         if now_ts - last_alert_ts > 21600:
             _send_alert(f"\u26a0\ufe0f <b>[NPB schedule 解析 0 game]</b>\n"
-                        f"{league_label} schedule HTML 抓到但 regex 找不到 game ID。\n"
-                        f"<i>可能 Yahoo Japan 改版 HTML 結構,regex `/npb/game/(\\d+)/` 需更新</i>", state)
+                        f"{league_label} schedule HTML 抓到但 <section class=\"bb-score\"> 區塊內找不到 game ID,且非休賽日。\n"
+                        f"<i>可能 Yahoo Japan 改版 HTML 結構,需檢查 schedule 頁面標記</i>", state)
             state[f"_npb_zero_games_alert_ts_{league}"] = now_ts
         return notifs
 
