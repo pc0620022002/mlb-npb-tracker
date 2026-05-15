@@ -2,8 +2,12 @@ name: Baseball Notifier
 
 on:
   schedule:
-    # 每 1 小時 fallback(萬一 self-trigger 全部失敗的最後保險)
-    - cron: '17 * * * *'
+    # 每 6 小時 fallback(萬一 self-trigger 全部失敗的最後保險)
+    # 不能太頻繁:每次 schedule cron 觸發都會 concurrency cancel 健康的舊 run,
+    # 新 run cache restore 跟舊 run cache save 之間有 GHA index eventual-consistency
+    # race window,踩到就會誤觸 [系統健檢] 假警報。Self-trigger 在 2h42m 處主動接力,
+    # 正常完全不需要 schedule cron 介入;只在 self-trigger 全部失敗時 cron 兜底。
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 # self-trigger relay 需要 actions:write;cache 用 default contents:read 即可
@@ -46,7 +50,7 @@ jobs:
       # 改在 run 內主動 self-trigger 接力 run:跑到剩 RELAY_LEAD_TIME 時呼叫 GHA API
       # workflow_dispatch 觸發新 run,新 run 啟動後 concurrency cancel 舊 run,
       # 舊 run 的 save-always cache step 仍會 fire 把最新 state 存進去,新 run restore 接續。
-      # cron `17 */2 * * *` 是 fallback,若 self-trigger 失敗也最多 2 小時恢復。
+      # cron `17 */6 * * *` 是 fallback,若 self-trigger 失敗最多 6 小時恢復。
       - name: Polling loop
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}

@@ -238,6 +238,60 @@ def _robust_get(url, retries=2, backoff_seq=(0.5, 2.0), **kwargs):
     log(f"  FAILED after {retries+1} attempts ({last_err}): {url[:80]}")
     return None
 
+def _is_gap_cache_race_false_alarm():
+    """新 run 啟動時 cache restore 可能命中比實際舊版的 state(GHA cache index eventual
+    consistency:舊 run 的 save 完成 → index 對 restore-keys prefix 搜尋可見 之間有秒級延遲),
+    造成 `_last_ok_ts` 看起來很舊、誤觸系統健檢警告。發送警告前先查 GHA API:
+    若上一個 workflow run 是 `cancelled` 且 `updated_at` 在最近 5 分鐘內,代表它是被
+    concurrency 取消的(健康狀態下被新 run 接手),系統實際沒有失聯 → suppress 警告。
+    其他情境(上一個 run failed / 久沒跑 / 真的 outage)→ 正常推警告。"""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GH_REPO") or os.environ.get("GITHUB_REPOSITORY")
+    this_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not (token and repo and this_run_id):
+        return False  # 本機跑 / 沒設 token / 缺 run id → 不 suppress(避免誤把某個 run 當作 prev)
+    try:
+        r = _robust_get(
+            f"https://api.github.com/repos/{repo}/actions/workflows/baseball.yml/runs",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            params={"per_page": 5},
+            timeout=10,
+        )
+        if r is None or r.status_code != 200:
+            return False
+        runs = r.json().get("workflow_runs", [])
+        prev = None
+        for run in runs:
+            if str(run.get("id")) != this_run_id:
+                prev = run
+                break
+        if prev is None:
+            return False
+        status = prev.get("status")
+        conclusion = prev.get("conclusion")
+        updated = prev.get("updated_at", "")
+        if not updated:
+            return False
+        updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        gap_sec = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+        # Case A:上一個 run 還顯示 in_progress → 正在被 concurrency 取消(API 狀態轉移要 ~60s)
+        #         代表本 run 啟動時舊 run 還健康,純 cache race
+        if status == "in_progress":
+            log(f"  prev run {prev.get('id')} still in_progress (updated {int(gap_sec)}s ago) → 判定 cache-race 假警報")
+            return True
+        # Case B:上一個 run 已標記 cancelled,且 10 分鐘內結束 → 剛被 concurrency cancel,也是 cache race
+        if status == "completed" and conclusion == "cancelled" and gap_sec < 600:
+            log(f"  prev run {prev.get('id')} cancelled {int(gap_sec)}s ago → 判定 cache-race 假警報")
+            return True
+        return False
+    except Exception as e:
+        log(f"  cache-race 檢查失敗 ({type(e).__name__}): {str(e)[:120]}")
+        return False
+
 def to_tw(iso):
     if not iso: return "未知"
     try:
@@ -1433,8 +1487,13 @@ def main():
             f"<i>這段時間可能漏推賽中事件,以下若有累積資料會在後續訊息送出。</i>\n"
             f"\U0001f50d 詳情看 GitHub Actions log"
         )
-        _send_alert(alert_msg, state)
-        log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
+        # 發送前先用 GHA API 驗證:若上一個 run 是「最近被 concurrency 取消的健康 run」
+        # → 這個 gap 是 cache restore 拿到 stale state 的假警報,suppress
+        if _is_gap_cache_race_false_alarm():
+            log(f"⚠️ Gap {gap_s}s > {prev_expected_interval*3}s,但驗證為 cache-race 假警報 → suppress")
+        else:
+            _send_alert(alert_msg, state)
+            log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
     elif last_ok_ts > 0:
         log(f"Last ok run {gap_s}s ago (prev_expected={prev_expected_interval}s, this_round_expected={expected_interval}s, teams_playing={teams_playing})")
     else:
