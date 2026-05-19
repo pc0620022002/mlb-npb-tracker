@@ -388,6 +388,61 @@ def _fmt_at_bats(ab_list):
 # Run 結束就丟棄(stats 每日變動,跨 run 用 cache 反而要寫 invalidation 邏輯,得不償失)。
 _SEASON_STATS_CACHE = {}
 
+# MLB league-aggregate stats(for OPS+ / ERA+ 計算分母)。整 run 一次,fail 設 sentinel。
+# None=未抓 / False=抓過失敗(避免重抓)/ dict=成功
+_MLB_LEAGUE_STATS_CACHE = None
+
+def _get_mlb_league_stats():
+    """抓 MLB 本季 30 隊 hitting + pitching raw counts,加總算 league OBP / SLG / ERA。
+    回 dict {"obp": float, "slg": float, "era": float},失敗回 None。
+    Park factor 不校正(需 ballpark factor 表,自維護成本高);算出來相當於「未經
+    park 校正版」OPS+/ERA+,跟 Baseball Reference 顯示值會有幾分差距,但量級正確。
+    """
+    global _MLB_LEAGUE_STATS_CACHE
+    if _MLB_LEAGUE_STATS_CACHE is not None:
+        return _MLB_LEAGUE_STATS_CACHE if _MLB_LEAGUE_STATS_CACHE is not False else None
+    try:
+        year = date.today().year
+        r = _robust_get(
+            "https://statsapi.mlb.com/api/v1/teams/stats",
+            params={"season": year, "stats": "season", "group": "hitting,pitching", "sportIds": 1},
+            timeout=10)
+        if not (r and r.ok):
+            _MLB_LEAGUE_STATS_CACHE = False
+            return None
+        agg = {"h": 0, "bb": 0, "hbp": 0, "ab": 0, "sf": 0, "tb": 0, "er": 0, "outs": 0}
+        for g in r.json().get("stats", []):
+            grp = g.get("group", {}).get("displayName", "")
+            for sp in g.get("splits", []):
+                s = sp.get("stat", {})
+                if grp == "hitting":
+                    agg["h"]  += s.get("hits", 0)
+                    agg["bb"] += s.get("baseOnBalls", 0)
+                    agg["hbp"]+= s.get("hitByPitch", 0)
+                    agg["ab"] += s.get("atBats", 0)
+                    agg["sf"] += s.get("sacFlies", 0)
+                    agg["tb"] += s.get("totalBases", 0)
+                elif grp == "pitching":
+                    agg["er"]  += s.get("earnedRuns", 0)
+                    agg["outs"]+= s.get("outs", 0)
+        # 分母 0 守護(球季初首日 / API 異常空回)
+        obp_denom = agg["ab"] + agg["bb"] + agg["hbp"] + agg["sf"]
+        if obp_denom == 0 or agg["ab"] == 0 or agg["outs"] == 0:
+            _MLB_LEAGUE_STATS_CACHE = False
+            return None
+        lg = {
+            "obp": (agg["h"] + agg["bb"] + agg["hbp"]) / obp_denom,
+            "slg": agg["tb"] / agg["ab"],
+            "era": 9 * agg["er"] / (agg["outs"] / 3),
+        }
+        _MLB_LEAGUE_STATS_CACHE = lg
+        log(f"MLB league avg: OBP={lg['obp']:.3f} SLG={lg['slg']:.3f} ERA={lg['era']:.2f}")
+        return lg
+    except Exception as e:
+        log(f"League stats err: {e}")
+        _MLB_LEAGUE_STATS_CACHE = False
+        return None
+
 def _get_season_stats(pid):
     """Fetch current season batting / pitching stats via MLB people stats endpoint.
     Returns dict with two sub-dicts: 'batting' / 'pitching'(各自欄位若該球員無紀錄則為空 dict)。
@@ -486,8 +541,17 @@ def _is_meaningful_stat(v):
     s = str(v).strip()
     return s not in ("", "-", ".---", "-.--", "--", "-.---")
 
-def _fmt_season_block_batter(b):
+def _safe_float(v):
+    """從 '.385' 之類字串轉 float;失敗回 None。"""
+    if v is None: return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+def _fmt_season_block_batter(b, lg=None):
     """產出本季打擊累積區塊。輸入 b 是 _get_season_stats()['batting'] 形式 dict。
+    lg 是 _get_mlb_league_stats() 回的 dict(用來算 OPS+);傳 None 就略過 OPS+。
     無任何欄位可顯示則回 None。"""
     if not b:
         return None
@@ -506,12 +570,19 @@ def _fmt_season_block_batter(b):
     if _is_meaningful_stat(slg): parts.append(f"SLG {slg}")
     ops = b.get("ops")
     if _is_meaningful_stat(ops): parts.append(f"OPS {ops}")
+    # OPS+ = 100 * (OBP/lgOBP + SLG/lgSLG - 1),round 到整數。未做 park 校正。
+    if lg and _is_meaningful_stat(obp) and _is_meaningful_stat(slg):
+        pobp = _safe_float(obp); pslg = _safe_float(slg)
+        if pobp is not None and pslg is not None and lg.get("obp", 0) > 0 and lg.get("slg", 0) > 0:
+            ops_plus = round(100 * (pobp / lg["obp"] + pslg / lg["slg"] - 1))
+            parts.append(f"OPS+ {ops_plus}")
     if not parts:
         return None
     return "\U0001f4c8 本季打擊:" + " / ".join(parts)
 
-def _fmt_season_block_pitcher(p):
+def _fmt_season_block_pitcher(p, lg=None):
     """產出本季投球累積區塊。輸入 p 是 _get_season_stats()['pitching'] 形式 dict。
+    lg 是 _get_mlb_league_stats() 回的 dict(用來算 ERA+);傳 None 就略過 ERA+。
     無任何欄位可顯示則回 None。"""
     if not p:
         return None
@@ -526,6 +597,13 @@ def _fmt_season_block_pitcher(p):
     if _is_meaningful_stat(k9): parts.append(f"K/9 {k9}")
     bb9 = p.get("bb9")
     if _is_meaningful_stat(bb9): parts.append(f"BB/9 {bb9}")
+    # ERA+ = 100 * lgERA / playerERA。Player ERA=0(無自責失分)→ 數學無限大,不顯示。
+    # 未做 park 校正。
+    if lg and _is_meaningful_stat(era):
+        pera = _safe_float(era)
+        if pera is not None and pera > 0 and lg.get("era", 0) > 0:
+            era_plus = round(100 * lg["era"] / pera)
+            parts.append(f"ERA+ {era_plus}")
     if not parts:
         return None
     return "\U0001f4c8 本季投球:" + " / ".join(parts)
@@ -733,13 +811,15 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                             lines.append("出場（無打擊/投球紀錄）")
                                         stat_str = "\n".join(lines)
                                         # Season 累積區塊:final 推播附本季數據(_get_season_stats 已 in-memory
-                                        # cache,同 run 內同球員不重抓 API)
+                                        # cache,同 run 內同球員不重抓 API)。
+                                        # League stats 給 OPS+ / ERA+ 算分母,抓不到就傳 None 跳過 plus 指標。
                                         season_full = _get_season_stats(pid_str)
+                                        lg_stats = _get_mlb_league_stats()
                                         sb_lines = []
-                                        bblk = _fmt_season_block_batter(season_full.get("batting", {}))
+                                        bblk = _fmt_season_block_batter(season_full.get("batting", {}), lg_stats)
                                         if bblk:
                                             sb_lines.append(bblk)
-                                        pblk = _fmt_season_block_pitcher(season_full.get("pitching", {}))
+                                        pblk = _fmt_season_block_pitcher(season_full.get("pitching", {}), lg_stats)
                                         if pblk:
                                             sb_lines.append(pblk)
                                         if sb_lines:
