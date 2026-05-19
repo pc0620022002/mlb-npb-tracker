@@ -837,7 +837,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                     if m:
                         k = f"{prefix}_{game_date_str}_lineup_{gp}_{pid}"
                         if k not in state:
-                            notifs.append(f"\u26be <b>[{label} 先發名單]</b>\n\U0001f3df {matchup}\n\U0001f464 <b>{m}</b> 已列入先發名單！\n\U0001f554 {to_tw(gt)}")
+                            notifs.append(f"\u26be <b>[{label} 先發名單]</b>\n\U0001f464 <b>{m}</b> 已列入先發名單！\n\U0001f554 {to_tw(gt)}")
                             state[k] = True
 
             for side in ["home","away"]:
@@ -848,7 +848,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                     if m:
                         k = f"{prefix}_{game_date_str}_pitcher_{gp}_{pid}"
                         if k not in state:
-                            notifs.append(f"\u26be <b>[{label} 預定先發投手]</b>\n\U0001f3df {matchup}\n\u26be <b>{m}</b> {_day_prefix(gt)}預定先發！\n\U0001f554 {to_tw(gt)}")
+                            notifs.append(f"\u26be <b>[{label} 預定先發投手]</b>\n\u26be <b>{m}</b> {_day_prefix(gt)}預定先發！\n\U0001f554 {to_tw(gt)}")
                             state[k] = True
 
             # --- Mid-game appearance AND Final results (combined) ---
@@ -916,9 +916,19 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                             if pl:
                                                 lines.append(pl)
                                         score_line = f"{away} {aws} - {hs} {home}"
+                                        # 賽中推播加當下第幾局(從 schedule hydrate 拿到的 linescore)
+                                        _ls = g.get("linescore") or {}
+                                        _inn = _ls.get("currentInning")
+                                        _half = _ls.get("inningHalf", "")
+                                        if _inn is not None:
+                                            _half_zh = "上" if _half == "Top" else ("下" if _half == "Bottom" else "")
+                                            _prefix = "延長" if _inn > 9 else ""
+                                            inning_suffix = f" {_prefix}{_inn}局{_half_zh}".rstrip()
+                                        else:
+                                            inning_suffix = ""
                                         stat_str = "\n".join(lines) if lines else "已進入比賽"
                                         tag = "賽中更新" if prev_snap else "賽中出場"
-                                        notifs.append(f"\u26be <b>[{label} {tag}]</b>\n\U0001f3df {matchup}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> 已上場！\n{stat_str}")
+                                        notifs.append(f"\u26be <b>[{label} {tag}]</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> 已上場！\n{stat_str}")
                                         state[live_key] = current_snap
 
                                 # --- First appearance for games already Final (no live updates sent) ---
@@ -1022,7 +1032,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                                       f"\u26be 完整本場紀錄:")
                                         else:
                                             header = f"\u26be <b>[{label} 比賽結果]</b>"
-                                        notifs.append(f"{header}\n\U0001f3df {matchup}\n\U0001f4ca {away} <b>{aws}</b> - <b>{hs}</b> {home}\n\U0001f464 <b>{m}</b>：\n{stat_str}")
+                                        notifs.append(f"{header}\n\U0001f4ca {away} <b>{aws}</b> - <b>{hs}</b> {home}\n\U0001f464 <b>{m}</b>：\n{stat_str}")
                                         state[final_key] = True
                 except Exception as e:
                     log(f"Boxscore err {gp}: {e}")
@@ -1182,6 +1192,18 @@ def _extract_npb_score(top_html):
     away_name = name_matches[1].strip() if len(name_matches) >= 2 else "?"
     return away_name, away_score, home_name, home_score
 
+def _extract_npb_inning(top_html):
+    """從 Yahoo Japan top.html best-effort 抓當前局數(賽中)。
+    格式「N回表」(攻方為客)/「N回裏」(攻方為主)。抓到回「N局上/下」,
+    沒抓到回空字串 → 推播訊息 silent skip 不顯示局數。"""
+    m = re.search(r'(\d+)回(表|裏)', top_html)
+    if not m:
+        return ""
+    n = int(m.group(1))
+    half = "上" if m.group(2) == "表" else "下"
+    prefix = "延長" if n > 9 else ""
+    return f"{prefix}{n}局{half}"
+
 def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
@@ -1329,6 +1351,8 @@ def _check_npb_league(state, league, league_label):
 
         # 場中/賽後比分(對齊 MLB/3A 推播格式)。賽前無 score markup → 回 None。
         score_info = _extract_npb_score(top_html)
+        # 場中局數(best-effort,抓不到 silent skip)
+        inning_str = _extract_npb_inning(top_html) if not is_finished else ""
 
         # Fetch stats page (contains per-player batting/pitching tables)
         stats_url = f"https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
@@ -1382,9 +1406,8 @@ def _check_npb_league(state, league, league_label):
                     prev_snap = state.get(live_key)
                     if prev_snap != full_stat:
                         tag = "賽中更新" if prev_snap else "賽中出場"
-                        msg = f"\u26be <b>[NPB {league_label} {tag}]</b>\n"
-                        if game_title:
-                            msg += f"\U0001f3df {game_title}\n"
+                        inning_suffix = f" {inning_str}" if inning_str else ""
+                        msg = f"\u26be <b>[NPB {league_label} {tag}]</b>{inning_suffix}\n"
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
                             msg += f"\U0001f4ca {aw_n} {aw_s} - {hm_s} {hm_n}\n"
@@ -1412,8 +1435,6 @@ def _check_npb_league(state, league, league_label):
                                    f"\U0001f4ca 完整本場紀錄:\n")
                         else:
                             msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b>\n"
-                        if game_title:
-                            msg += f"\U0001f3df {game_title}\n"
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
                             msg += f"\U0001f4ca {aw_n} <b>{aw_s}</b> - <b>{hm_s}</b> {hm_n}\n"
@@ -1435,8 +1456,6 @@ def _check_npb_league(state, league, league_label):
                     lineup_key = f"npb_{game_date}_lineup_{game_id}_{player_name}"
                     if lineup_key not in state:
                         msg = f"\u26be <b>[NPB {league_label} 先發名單]</b>\n"
-                        if game_title:
-                            msg += f"\U0001f3df {game_title}\n"
                         msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 列入先發！\n"
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/top"
                         notifs.append(msg)
