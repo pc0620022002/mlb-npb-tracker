@@ -384,10 +384,22 @@ def _fmt_at_bats(ab_list):
             lines.append(f"  {i+1}. {item}")
     return "📝 每打席：\n" + "\n".join(lines)
 
+# In-memory cache for season stats: 同一個 run 內同球員不重複查 API。
+# Run 結束就丟棄(stats 每日變動,跨 run 用 cache 反而要寫 invalidation 邏輯,得不償失)。
+_SEASON_STATS_CACHE = {}
+
 def _get_season_stats(pid):
-    """Fetch current season batting avg and pitching ERA via MLB people stats endpoint (fallback).
-    Returns dict with 'avg' and 'era' keys (either may be None)."""
-    result = {"avg": None, "era": None}
+    """Fetch current season batting / pitching stats via MLB people stats endpoint.
+    Returns dict with two sub-dicts: 'batting' / 'pitching'(各自欄位若該球員無紀錄則為空 dict)。
+    每個 sub-dict 可能含:
+      batting:  avg, hr, rbi, sb, obp, slg, ops, games
+      pitching: w, l, era, whip, ip, k9, bb9, games
+    任一欄位查不到就缺 key,渲染端負責 fallback / 跳過。
+    """
+    cache_key = str(pid)
+    if cache_key in _SEASON_STATS_CACHE:
+        return _SEASON_STATS_CACHE[cache_key]
+    result = {"batting": {}, "pitching": {}, "avg": None, "era": None}  # 保留 avg/era 給舊呼叫端
     try:
         year = date.today().year
         r = _robust_get(
@@ -396,15 +408,36 @@ def _get_season_stats(pid):
             timeout=10)
         if r and r.ok:
             for stat_group in r.json().get("stats", []):
+                group_name = stat_group.get("group", {}).get("displayName", "")
                 splits = stat_group.get("splits", [])
-                if splits:
-                    stat = splits[0].get("stat", {})
-                    if "avg" in stat:
-                        result["avg"] = stat["avg"]
-                    if "era" in stat:
-                        result["era"] = stat["era"]
+                if not splits:
+                    continue
+                stat = splits[0].get("stat", {})
+                if group_name == "hitting":
+                    b = result["batting"]
+                    if "avg" in stat: b["avg"] = stat["avg"]
+                    if "homeRuns" in stat: b["hr"] = stat["homeRuns"]
+                    if "rbi" in stat: b["rbi"] = stat["rbi"]
+                    if "stolenBases" in stat: b["sb"] = stat["stolenBases"]
+                    if "obp" in stat: b["obp"] = stat["obp"]
+                    if "slg" in stat: b["slg"] = stat["slg"]
+                    if "ops" in stat: b["ops"] = stat["ops"]
+                    if "gamesPlayed" in stat: b["games"] = stat["gamesPlayed"]
+                    if "avg" in stat: result["avg"] = stat["avg"]  # 舊欄位相容
+                elif group_name == "pitching":
+                    p = result["pitching"]
+                    if "wins" in stat: p["w"] = stat["wins"]
+                    if "losses" in stat: p["l"] = stat["losses"]
+                    if "era" in stat: p["era"] = stat["era"]
+                    if "whip" in stat: p["whip"] = stat["whip"]
+                    if "inningsPitched" in stat: p["ip"] = stat["inningsPitched"]
+                    if "strikeoutsPer9Inn" in stat: p["k9"] = stat["strikeoutsPer9Inn"]
+                    if "walksPer9Inn" in stat: p["bb9"] = stat["walksPer9Inn"]
+                    if "gamesPlayed" in stat: p["games"] = stat["gamesPlayed"]
+                    if "era" in stat: result["era"] = stat["era"]  # 舊欄位相容
     except Exception as e:
         log(f"Season stats err {pid}: {e}")
+    _SEASON_STATS_CACHE[cache_key] = result
     return result
 
 def _fmt_pitcher_line(pit, season_era=None):
@@ -446,6 +479,56 @@ def _fmt_batter_stats(bat, season_avg=None):
     if season_avg and season_avg not in ("-", ".---"):
         line += f" (打率{season_avg})"
     return line
+
+def _is_meaningful_stat(v):
+    """過濾 statsapi 回的「沒紀錄」表徵:None / '-' / '.---' / '-.--' / '' """
+    if v is None: return False
+    s = str(v).strip()
+    return s not in ("", "-", ".---", "-.--", "--", "-.---")
+
+def _fmt_season_block_batter(b):
+    """產出本季打擊累積區塊。輸入 b 是 _get_season_stats()['batting'] 形式 dict。
+    無任何欄位可顯示則回 None。"""
+    if not b:
+        return None
+    parts = []
+    avg = b.get("avg")
+    if _is_meaningful_stat(avg): parts.append(f"AVG {avg}")
+    hr = b.get("hr")
+    if hr is not None and hr != 0: parts.append(f"{hr}HR")
+    rbi = b.get("rbi")
+    if rbi is not None and rbi != 0: parts.append(f"{rbi}打點")
+    sb = b.get("sb")
+    if sb is not None and sb != 0: parts.append(f"{sb}盜")
+    obp = b.get("obp")
+    if _is_meaningful_stat(obp): parts.append(f"OBP {obp}")
+    slg = b.get("slg")
+    if _is_meaningful_stat(slg): parts.append(f"SLG {slg}")
+    ops = b.get("ops")
+    if _is_meaningful_stat(ops): parts.append(f"OPS {ops}")
+    if not parts:
+        return None
+    return "\U0001f4c8 本季打擊:" + " / ".join(parts)
+
+def _fmt_season_block_pitcher(p):
+    """產出本季投球累積區塊。輸入 p 是 _get_season_stats()['pitching'] 形式 dict。
+    無任何欄位可顯示則回 None。"""
+    if not p:
+        return None
+    parts = []
+    w = p.get("w"); l = p.get("l")
+    if w is not None and l is not None: parts.append(f"{w}勝{l}敗")
+    era = p.get("era")
+    if _is_meaningful_stat(era): parts.append(f"ERA {era}")
+    whip = p.get("whip")
+    if _is_meaningful_stat(whip): parts.append(f"WHIP {whip}")
+    k9 = p.get("k9")
+    if _is_meaningful_stat(k9): parts.append(f"K/9 {k9}")
+    bb9 = p.get("bb9")
+    if _is_meaningful_stat(bb9): parts.append(f"BB/9 {bb9}")
+    if not parts:
+        return None
+    return "\U0001f4c8 本季投球:" + " / ".join(parts)
 
 def check_schedule(sport_id, prefix, label, state, players=None):
     if players is None:
@@ -649,6 +732,18 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         if not lines:
                                             lines.append("出場（無打擊/投球紀錄）")
                                         stat_str = "\n".join(lines)
+                                        # Season 累積區塊:final 推播附本季數據(_get_season_stats 已 in-memory
+                                        # cache,同 run 內同球員不重抓 API)
+                                        season_full = _get_season_stats(pid_str)
+                                        sb_lines = []
+                                        bblk = _fmt_season_block_batter(season_full.get("batting", {}))
+                                        if bblk:
+                                            sb_lines.append(bblk)
+                                        pblk = _fmt_season_block_pitcher(season_full.get("pitching", {}))
+                                        if pblk:
+                                            sb_lines.append(pblk)
+                                        if sb_lines:
+                                            stat_str = stat_str + "\n——\n" + "\n".join(sb_lines)
                                         if is_missed_live:
                                             header = (f"\u26a0\ufe0f <b>[{label} 比賽結果 — 系統補推]</b>\n"
                                                       f"<i>此球員從未在 live 階段被推播,中段過程可能因系統空白漏掉</i>\n"
