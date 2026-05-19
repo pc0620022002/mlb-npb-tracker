@@ -1204,6 +1204,253 @@ def _extract_npb_inning(top_html):
     prefix = "延長" if n > 9 else ""
     return f"{prefix}{n}局{half}"
 
+# NPB qualified player rankings cache(對齊 MLB 的 final 推播附本季 stats + 聯盟排名)。
+# 來源:npb.jp 官方 2026 season stats 四張表(セ・パ × 打/投),SSR 靜態頁。
+# 結構同 _MLB_RANKINGS_CACHE:{"batting": {normalized_name: {...}}, "pitching": {...}}
+# None=未抓 / False=抓過失敗(避免重抓)/ dict=成功
+_NPB_RANKINGS_CACHE = None
+
+def _norm_npb_name(name):
+    """去除半形 / 全形空格 + 兩端空白,用於 npb.jp 球員名「林　安可」對齊
+    NPB_PLAYERS_INFO key「林安可」的 lookup。"""
+    return re.sub(r'[\s\u3000]+', '', name or '').strip()
+
+def _ip_to_decimal(ip_str):
+    """NPB 投球回轉小數:「46.1」=46又1/3局 → 46.333,「46.2」=46又2/3 → 46.667。"""
+    if not ip_str:
+        return 0.0
+    try:
+        if '.' in ip_str:
+            whole, third = ip_str.split('.', 1)
+            return float(whole) + int(third) / 3
+        return float(ip_str)
+    except (ValueError, TypeError):
+        return 0.0
+
+def _parse_npb_stats_table(html, mode):
+    """Parse 一張 npb.jp season stats 表。
+    mode='batting' → 24 td cells per row;'pitching' → 25 td cells per row。
+    回 list of dict(每筆含 name (normalized)、team_abbr、stats）。"""
+    rows = []
+    trs = re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', html)
+    expected = 24 if mode == 'batting' else 25
+    for tr in trs:
+        tds = re.findall(r'<td[^>]*>([\s\S]*?)</td>', tr)
+        if len(tds) != expected:
+            continue
+        cells = [re.sub(r'<[^>]+>', '', t).strip() for t in tds]
+        # Cell 1 format: "佐藤　輝明(神)" — name + team in parentheses
+        name_team = cells[1]
+        team_m = re.search(r'\(([^)]+)\)\s*$', name_team)
+        team_abbr = team_m.group(1) if team_m else ''
+        raw_name = re.sub(r'\([^)]+\)\s*$', '', name_team).strip()
+        nname = _norm_npb_name(raw_name)
+        if not nname:
+            continue
+        if mode == 'batting':
+            # idx: 0 rank 1 name(team) 2 avg 3 G 4 PA 5 AB 6 R 7 H 8 2B 9 3B 10 HR
+            # 11 TB 12 RBI 13 SB 14 CS 15 SH 16 SF 17 BB 18 IBB 19 HBP 20 K 21 DP 22 SLG 23 OBP
+            try:
+                avg = cells[2]
+                hr = int(cells[10] or 0)
+                rbi = int(cells[12] or 0)
+                sb = int(cells[13] or 0)
+                slg_f = float(cells[22]) if cells[22] else 0.0
+                obp_f = float(cells[23]) if cells[23] else 0.0
+                ops_f = slg_f + obp_f
+                rows.append({
+                    'name': nname, 'team': team_abbr,
+                    'avg': avg, 'hr': hr, 'rbi': rbi, 'sb': sb,
+                    'slg': cells[22], 'obp': cells[23],
+                    'ops': f'{ops_f:.3f}'.lstrip('0') if ops_f else '.000',
+                    '_ops_f': ops_f,
+                })
+            except (ValueError, IndexError):
+                continue
+        else:
+            # idx: 0 rank 1 name(team) 2 era 3 G 4 W 5 L 6 S 7 HLD 8 HP 9 CG 10 SHO_W
+            # 11 NoBB 12 win% 13 BF 14 IP 15 H 16 HR 17 BB 18 IBB 19 HBP 20 K 21 WP 22 BK 23 R 24 ER
+            try:
+                era = cells[2]
+                w = int(cells[4] or 0)
+                l = int(cells[5] or 0)
+                ip_dec = _ip_to_decimal(cells[14])
+                h_count = int(cells[15] or 0)
+                bb_count = int(cells[17] or 0)
+                k_count = int(cells[20] or 0)
+                whip = (h_count + bb_count) / ip_dec if ip_dec > 0 else 0
+                rows.append({
+                    'name': nname, 'team': team_abbr,
+                    'era': era, 'w': w, 'l': l, 'k': k_count, 'bb': bb_count,
+                    'ip_dec': ip_dec, 'h': h_count,
+                    'whip': f'{whip:.2f}' if ip_dec > 0 else '-.--',
+                    '_whip_f': whip if ip_dec > 0 else None,
+                })
+            except (ValueError, IndexError):
+                continue
+    return rows
+
+def _get_npb_rankings():
+    """抓 npb.jp 2026 セ・リーグ + パ・リーグ × 打 / 投 4 張 stats 表,合併計算全 NPB
+    qualified hitters / pitchers 排名。Roster 12 人多為二/三軍/育成,大多不會在
+    qualified list 內 → silent skip 不顯示 season block + rank。未來球員上一軍且
+    qualified 自動會出現 → 不需改 code。失敗 cache False sentinel 不重抓。"""
+    global _NPB_RANKINGS_CACHE
+    if _NPB_RANKINGS_CACHE is not None:
+        return _NPB_RANKINGS_CACHE if _NPB_RANKINGS_CACHE is not False else None
+    try:
+        year = date.today().year
+        bat_rows = []
+        pit_rows = []
+        for league in ('c', 'p'):
+            url_b = f'https://npb.jp/bis/{year}/stats/bat_{league}.html'
+            url_p = f'https://npb.jp/bis/{year}/stats/pit_{league}.html'
+            for url, mode, accum in [(url_b, 'batting', bat_rows), (url_p, 'pitching', pit_rows)]:
+                r = _robust_get(url, timeout=12,
+                                headers={"User-Agent": "Mozilla/5.0 (compatible; MLB-NPB-Tracker)"})
+                if not (r and r.ok):
+                    continue
+                # npb.jp response 沒在 Content-Type 寫 charset → requests 預設 ISO-8859-1
+                # → 中文 / 日文 mojibake。強制用 UTF-8 decode raw content。
+                html = r.content.decode('utf-8', errors='ignore')
+                accum.extend(_parse_npb_stats_table(html, mode))
+        if not bat_rows and not pit_rows:
+            _NPB_RANKINGS_CACHE = False
+            return None
+        # Dense rank per stat
+        def dense(rows, key, reverse=True):
+            valid = [(r['name'], r[key]) for r in rows if r.get(key) is not None]
+            valid.sort(key=lambda x: x[1], reverse=reverse)
+            ranks = {}
+            prev = object()
+            prev_rk = 0
+            for i, (n, v) in enumerate(valid):
+                if v != prev:
+                    prev_rk = i + 1
+                    prev = v
+                ranks[n] = prev_rk
+            return ranks
+        # Batting:打率(avg float)、HR、RBI、SB、OPS 都降冪
+        def safe_float(s):
+            try: return float(s)
+            except: return None
+        bat_avg_rank = dense([{**r, 'avg_f': safe_float(r['avg'])} for r in bat_rows if safe_float(r['avg']) is not None], 'avg_f', reverse=True)
+        bat_hr_rank  = dense(bat_rows, 'hr', reverse=True)
+        bat_rbi_rank = dense(bat_rows, 'rbi', reverse=True)
+        bat_sb_rank  = dense(bat_rows, 'sb', reverse=True)
+        bat_ops_rank = dense(bat_rows, '_ops_f', reverse=True)
+        batting = {}
+        for r in bat_rows:
+            batting[r['name']] = {
+                'avg': r['avg'], 'hr': r['hr'], 'rbi': r['rbi'], 'sb': r['sb'],
+                'slg': r['slg'], 'obp': r['obp'], 'ops': r['ops'], 'team': r['team'],
+                'rank_avg': bat_avg_rank.get(r['name']),
+                'rank_hr': bat_hr_rank.get(r['name']),
+                'rank_rbi': bat_rbi_rank.get(r['name']),
+                'rank_sb': bat_sb_rank.get(r['name']),
+                'rank_ops': bat_ops_rank.get(r['name']),
+            }
+        # Pitching:ERA / WHIP 升冪(小=好);W / L / K 降冪;BB 升冪(少=好)
+        pit_era_rank = dense([{**r, 'era_f': safe_float(r['era'])} for r in pit_rows if safe_float(r['era']) is not None], 'era_f', reverse=False)
+        pit_whip_rank= dense([r for r in pit_rows if r.get('_whip_f') is not None], '_whip_f', reverse=False)
+        pit_w_rank   = dense(pit_rows, 'w', reverse=True)
+        pit_l_rank   = dense(pit_rows, 'l', reverse=True)
+        pit_k_rank   = dense(pit_rows, 'k', reverse=True)
+        pit_bb_rank  = dense(pit_rows, 'bb', reverse=False)
+        pitching = {}
+        for r in pit_rows:
+            pitching[r['name']] = {
+                'era': r['era'], 'w': r['w'], 'l': r['l'], 'k': r['k'], 'bb': r['bb'],
+                'whip': r['whip'], 'team': r['team'],
+                'rank_era': pit_era_rank.get(r['name']),
+                'rank_whip': pit_whip_rank.get(r['name']),
+                'rank_w': pit_w_rank.get(r['name']),
+                'rank_l': pit_l_rank.get(r['name']),
+                'rank_k': pit_k_rank.get(r['name']),
+                'rank_bb': pit_bb_rank.get(r['name']),
+            }
+        _NPB_RANKINGS_CACHE = {'batting': batting, 'pitching': pitching}
+        log(f"NPB rankings: qualified hitters={len(batting)}, pitchers={len(pitching)}")
+        return _NPB_RANKINGS_CACHE
+    except Exception as e:
+        log(f"NPB rankings err: {e}")
+        _NPB_RANKINGS_CACHE = False
+        return None
+
+def _fmt_npb_season_block_batter(chinese_name, rankings):
+    """NPB 打者季 stats block。chinese_name 為 NPB_PLAYERS_INFO 的 key(如「林安可」)。
+    沒在 qualified list → return None silent skip(NPB 名單多為二/三軍,跟 MLB『打數不足』
+    顯式提示不同,此為設計取捨:NPB qualified hitters 約 80-100 人,絕大多數名單球員
+    不在內,顯示「打數不足」會 noisy)。"""
+    if not rankings or 'batting' not in rankings:
+        return None
+    b = rankings['batting'].get(chinese_name)
+    if not b:
+        return None
+    parts = []
+    if b.get('avg'): parts.append(f"AVG {b['avg']}")
+    if b.get('hr') is not None and b['hr'] != 0: parts.append(f"{b['hr']}HR")
+    if b.get('rbi') is not None and b['rbi'] != 0: parts.append(f"{b['rbi']}打點")
+    if b.get('sb') is not None and b['sb'] != 0: parts.append(f"{b['sb']}盜")
+    if b.get('obp'): parts.append(f"OBP {b['obp']}")
+    if b.get('slg'): parts.append(f"SLG {b['slg']}")
+    if b.get('ops'): parts.append(f"OPS {b['ops']}")
+    if not parts:
+        return None
+    return "\U0001f4c8 本季打擊:" + " / ".join(parts)
+
+def _fmt_npb_season_block_pitcher(chinese_name, rankings):
+    """NPB 投手季 stats block。"""
+    if not rankings or 'pitching' not in rankings:
+        return None
+    p = rankings['pitching'].get(chinese_name)
+    if not p:
+        return None
+    parts = []
+    if p.get('w') is not None and p.get('l') is not None:
+        parts.append(f"{p['w']}勝{p['l']}敗")
+    if p.get('era'): parts.append(f"ERA {p['era']}")
+    if p.get('whip') and p['whip'] != '-.--': parts.append(f"WHIP {p['whip']}")
+    if p.get('k') is not None: parts.append(f"K {p['k']}")
+    if p.get('bb') is not None: parts.append(f"BB {p['bb']}")
+    if not parts:
+        return None
+    return "\U0001f4c8 本季投球:" + " / ".join(parts)
+
+def _fmt_npb_rank_block_batter(chinese_name, rankings):
+    """NPB 打者聯盟排名 block。沒在 qualified list → return None silent skip。"""
+    if not rankings or 'batting' not in rankings:
+        return None
+    b = rankings['batting'].get(chinese_name)
+    if not b:
+        return None
+    parts = []
+    for label, key in [("AVG", "rank_avg"), ("HR", "rank_hr"), ("RBI", "rank_rbi"),
+                       ("SB", "rank_sb"), ("OPS", "rank_ops")]:
+        rk = b.get(key)
+        if rk is not None:
+            parts.append(f"{label} 第{rk}名")
+    if not parts:
+        return None
+    return "\U0001f4ca 聯盟排名(打):" + " / ".join(parts)
+
+def _fmt_npb_rank_block_pitcher(chinese_name, rankings):
+    """NPB 投手聯盟排名 block。BB 升冪(保送少=排前),K 降冪;ERA / WHIP 升冪。"""
+    if not rankings or 'pitching' not in rankings:
+        return None
+    p = rankings['pitching'].get(chinese_name)
+    if not p:
+        return None
+    parts = []
+    for label, key in [("W", "rank_w"), ("L", "rank_l"), ("ERA", "rank_era"),
+                       ("WHIP", "rank_whip"), ("K", "rank_k"), ("BB", "rank_bb")]:
+        rk = p.get(key)
+        if rk is not None:
+            parts.append(f"{label} 第{rk}名")
+    if not parts:
+        return None
+    return "\U0001f4ca 聯盟排名(投):" + " / ".join(parts)
+
 def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
@@ -1440,6 +1687,24 @@ def _check_npb_league(state, league, league_label):
                             msg += f"\U0001f4ca {aw_n} <b>{aw_s}</b> - <b>{hm_s}</b> {hm_n}\n"
                         msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 出場！\n"
                         msg += f"{full_stat}\n"
+                        # 對齊 MLB final 推播 — 附本季季 stats + 聯盟排名(qualified player only)
+                        # 用 bat_stats / pit_stats 判斷該球員本場身分,對應加 batter/pitcher block;
+                        # 不在 NPB qualified list → silent skip(NPB 名單多為二/三軍/育成,
+                        # 大多數不會 qualified,顯式提示「打數不足」會 noisy)
+                        npb_rankings = _get_npb_rankings()
+                        sb_lines = []
+                        if bat_stats:
+                            bblk = _fmt_npb_season_block_batter(player_name, npb_rankings)
+                            if bblk: sb_lines.append(bblk)
+                            rblk = _fmt_npb_rank_block_batter(player_name, npb_rankings)
+                            if rblk: sb_lines.append(rblk)
+                        if pit_stats:
+                            pblk = _fmt_npb_season_block_pitcher(player_name, npb_rankings)
+                            if pblk: sb_lines.append(pblk)
+                            rpblk = _fmt_npb_rank_block_pitcher(player_name, npb_rankings)
+                            if rpblk: sb_lines.append(rpblk)
+                        if sb_lines:
+                            msg += "——\n" + "\n".join(sb_lines) + "\n"
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
                         notifs.append(msg)
                         state[final_key] = True
