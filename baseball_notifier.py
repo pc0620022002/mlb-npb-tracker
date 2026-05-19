@@ -444,31 +444,49 @@ def _get_mlb_league_stats():
         return None
 
 def _get_season_stats(pid):
-    """Fetch current season batting / pitching stats via MLB people stats endpoint.
-    Returns dict with two sub-dicts: 'batting' / 'pitching'(各自欄位若該球員無紀錄則為空 dict)。
-    每個 sub-dict 可能含:
-      batting:  avg, hr, rbi, sb, obp, slg, ops, games
-      pitching: w, l, era, whip, ip, k9, bb9, games
-    任一欄位查不到就缺 key,渲染端負責 fallback / 跳過。
+    """Fetch current season stats + primaryPosition via 合併 hydrate endpoint(一次 API call)。
+    根據球員「本主位置」過濾:
+      - 純投手(primaryPosition.type='Pitcher')→ 只保留 pitching group,清空 batting
+      - 兩用打者(type='Two-Way Player',目前只有 Ohtani)→ 兩個 group 都保留
+      - 野手(Infielder/Outfielder/Catcher/Designated Hitter)→ 只保留 batting,清空 pitching
+    這樣即使極罕見「投手緊急代打」或「野手緊急上投手丘」造成 statsapi 兩個 group 都有
+    紀錄,推播也只顯示主身分,避免單一球員推 2 條本季區塊困惑 user。
+    Returns dict: {"batting": {...}, "pitching": {...}, "avg": str|None, "era": str|None, "role": str}
     """
     cache_key = str(pid)
     if cache_key in _SEASON_STATS_CACHE:
         return _SEASON_STATS_CACHE[cache_key]
-    result = {"batting": {}, "pitching": {}, "avg": None, "era": None}  # 保留 avg/era 給舊呼叫端
+    result = {"batting": {}, "pitching": {}, "avg": None, "era": None, "role": ""}
     try:
         year = date.today().year
         r = _robust_get(
-            f"https://statsapi.mlb.com/api/v1/people/{pid}/stats",
-            params={"stats": "season", "season": year, "group": "hitting,pitching"},
+            f"https://statsapi.mlb.com/api/v1/people/{pid}",
+            params={"hydrate": f"stats(group=[hitting,pitching],type=season,season={year})"},
             timeout=10)
         if r and r.ok:
-            for stat_group in r.json().get("stats", []):
+            ppl = r.json().get("people", [{}])[0]
+            role = ppl.get("primaryPosition", {}).get("type", "")
+            result["role"] = role
+            # Parse stats only for relevant group(s):
+            #   Pitcher → 只 pitching
+            #   Two-Way Player → 兩個都保留(Ohtani)
+            #   Infielder/Outfielder/Catcher/Designated Hitter → 只 batting
+            #   空字串(API 未回 primaryPosition,罕見)→ 保守保留兩個,讓 _fmt_* 自己過濾
+            if role == "Pitcher":
+                keep_bat, keep_pit = False, True
+            elif role == "Two-Way Player":
+                keep_bat, keep_pit = True, True
+            elif role == "":
+                keep_bat, keep_pit = True, True
+            else:
+                keep_bat, keep_pit = True, False
+            for stat_group in ppl.get("stats", []):
                 group_name = stat_group.get("group", {}).get("displayName", "")
                 splits = stat_group.get("splits", [])
                 if not splits:
                     continue
                 stat = splits[0].get("stat", {})
-                if group_name == "hitting":
+                if group_name == "hitting" and keep_bat:
                     b = result["batting"]
                     if "avg" in stat: b["avg"] = stat["avg"]
                     if "homeRuns" in stat: b["hr"] = stat["homeRuns"]
@@ -479,7 +497,7 @@ def _get_season_stats(pid):
                     if "ops" in stat: b["ops"] = stat["ops"]
                     if "gamesPlayed" in stat: b["games"] = stat["gamesPlayed"]
                     if "avg" in stat: result["avg"] = stat["avg"]  # 舊欄位相容
-                elif group_name == "pitching":
+                elif group_name == "pitching" and keep_pit:
                     p = result["pitching"]
                     if "wins" in stat: p["w"] = stat["wins"]
                     if "losses" in stat: p["l"] = stat["losses"]
