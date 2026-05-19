@@ -392,6 +392,114 @@ _SEASON_STATS_CACHE = {}
 # None=未抓 / False=抓過失敗(避免重抓)/ dict=成功
 _MLB_LEAGUE_STATS_CACHE = None
 
+# MLB qualified player rankings cache(用於 final 推播附「聯盟排名第 N」資訊)。
+# 結構:{"batting": {pid: {"avg": rank, "hr": rank, ...}}, "pitching": {pid: {...}}}
+# 不在 qualified list 的 pid 直接缺 key,渲染端用「打數/局數不足」處理。
+# 整 run cache 一次,fail 設 False sentinel。
+_MLB_RANKINGS_CACHE = None
+
+def _dense_rank(items, key, reverse=True):
+    """對 (pid, value) iterable 按 value 排序,給出 dense rank dict {pid: rank}。
+    相同 value 共享 rank。reverse=True 是降冪(數值大 = 排第 1)。
+    `key` 是從 split 取出 value 的 callable,回 None / 失敗的 split 跳過。"""
+    rows = []
+    for sp in items:
+        pid = sp.get("player", {}).get("id")
+        val = key(sp.get("stat", {}))
+        if pid is None or val is None:
+            continue
+        rows.append((pid, val))
+    rows.sort(key=lambda x: x[1], reverse=reverse)
+    ranks = {}
+    prev_val = object()
+    prev_rank = 0
+    for idx, (pid, val) in enumerate(rows):
+        if val != prev_val:
+            prev_rank = idx + 1
+            prev_val = val
+        ranks[pid] = prev_rank
+    return ranks
+
+def _safe_stat_float(stat, key):
+    """從 stat dict 取 key 並轉 float(處理「.385」字串)。失敗回 None。"""
+    v = stat.get(key)
+    if v is None: return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+def _get_mlb_rankings():
+    """抓 MLB 2026 qualified hitters / pitchers,client-side dense-rank 各指標。
+    回 dict:{"batting": {pid: {avg, hr, rbi, sb, ops}}, "pitching": {pid: {w, l, era, whip, k, bb9}}}
+    Rank 方向:
+      - 打者全降冪(數值大/高 = 排第 1):avg, hr, rbi, sb, ops
+      - 投手 W / L / K 降冪(對齊「球員資料卡上的累積數值方向」)
+      - 投手 ERA / WHIP / BB9 升冪(數值小 = 排第 1,符合「越低越好」直覺)
+    失敗回 None。整 run cache。"""
+    global _MLB_RANKINGS_CACHE
+    if _MLB_RANKINGS_CACHE is not None:
+        return _MLB_RANKINGS_CACHE if _MLB_RANKINGS_CACHE is not False else None
+    try:
+        year = date.today().year
+        rb = _robust_get(
+            "https://statsapi.mlb.com/api/v1/stats",
+            params={"stats": "season", "group": "hitting", "sportIds": 1,
+                    "season": year, "playerPool": "qualified", "limit": 500},
+            timeout=15)
+        rp = _robust_get(
+            "https://statsapi.mlb.com/api/v1/stats",
+            params={"stats": "season", "group": "pitching", "sportIds": 1,
+                    "season": year, "playerPool": "qualified", "limit": 500},
+            timeout=15)
+        if not (rb and rb.ok and rp and rp.ok):
+            _MLB_RANKINGS_CACHE = False
+            return None
+        hit_splits = []
+        for g in rb.json().get("stats", []):
+            hit_splits = g.get("splits", [])
+            break
+        pit_splits = []
+        for g in rp.json().get("stats", []):
+            pit_splits = g.get("splits", [])
+            break
+        # Dense rank per stat
+        avg_r  = _dense_rank(hit_splits, lambda s: _safe_stat_float(s, "avg"), reverse=True)
+        hr_r   = _dense_rank(hit_splits, lambda s: s.get("homeRuns"),         reverse=True)
+        rbi_r  = _dense_rank(hit_splits, lambda s: s.get("rbi"),              reverse=True)
+        sb_r   = _dense_rank(hit_splits, lambda s: s.get("stolenBases"),      reverse=True)
+        ops_r  = _dense_rank(hit_splits, lambda s: _safe_stat_float(s, "ops"),reverse=True)
+        w_r    = _dense_rank(pit_splits, lambda s: s.get("wins"),             reverse=True)
+        l_r    = _dense_rank(pit_splits, lambda s: s.get("losses"),           reverse=True)
+        era_r  = _dense_rank(pit_splits, lambda s: _safe_stat_float(s,"era"), reverse=False)
+        whip_r = _dense_rank(pit_splits, lambda s: _safe_stat_float(s,"whip"),reverse=False)
+        k_r    = _dense_rank(pit_splits, lambda s: s.get("strikeOuts"),       reverse=True)
+        bb9_r  = _dense_rank(pit_splits, lambda s: _safe_stat_float(s,"walksPer9Inn"), reverse=False)
+        # Aggregate per pid
+        batting = {}
+        for sp in hit_splits:
+            pid = sp.get("player",{}).get("id")
+            if pid is None: continue
+            batting[pid] = {
+                "avg": avg_r.get(pid), "hr": hr_r.get(pid), "rbi": rbi_r.get(pid),
+                "sb": sb_r.get(pid), "ops": ops_r.get(pid),
+            }
+        pitching = {}
+        for sp in pit_splits:
+            pid = sp.get("player",{}).get("id")
+            if pid is None: continue
+            pitching[pid] = {
+                "w": w_r.get(pid), "l": l_r.get(pid), "era": era_r.get(pid),
+                "whip": whip_r.get(pid), "k": k_r.get(pid), "bb9": bb9_r.get(pid),
+            }
+        _MLB_RANKINGS_CACHE = {"batting": batting, "pitching": pitching}
+        log(f"MLB rankings: qualified hitters={len(batting)}, pitchers={len(pitching)}")
+        return _MLB_RANKINGS_CACHE
+    except Exception as e:
+        log(f"Rankings err: {e}")
+        _MLB_RANKINGS_CACHE = False
+        return None
+
 def _get_mlb_league_stats():
     """抓 MLB 本季 30 隊 hitting + pitching raw counts,加總算 league OBP / SLG / ERA。
     回 dict {"obp": float, "slg": float, "era": float},失敗回 None。
@@ -626,6 +734,53 @@ def _fmt_season_block_pitcher(p, lg=None):
         return None
     return "\U0001f4c8 本季投球:" + " / ".join(parts)
 
+def _fmt_league_rank_block_batter(pid, rankings):
+    """產出打者「📊 聯盟排名(打)」一行。
+    rankings 是 _get_mlb_rankings() 回的 dict;傳 None / 抓失敗 → 回 None 整段省略。
+    pid 不在 qualified batting list → 回「打數不足」一行。
+    pid 是 int 或 str(boxscore 的 pid_str)— 統一轉 int 比對。"""
+    if not rankings or "batting" not in rankings:
+        return None
+    try:
+        pid_int = int(pid)
+    except (ValueError, TypeError):
+        return None
+    bat = rankings["batting"].get(pid_int)
+    if bat is None:
+        return "\U0001f4ca 聯盟排名(打):打數不足"
+    parts = []
+    for label, key in [("AVG", "avg"), ("HR", "hr"), ("RBI", "rbi"),
+                       ("SB", "sb"), ("OPS", "ops")]:
+        rk = bat.get(key)
+        if rk is not None:
+            parts.append(f"{label} 第{rk}名")
+    if not parts:
+        return None
+    return "\U0001f4ca 聯盟排名(打):" + " / ".join(parts)
+
+def _fmt_league_rank_block_pitcher(pid, rankings):
+    """產出投手「📊 聯盟排名(投)」一行。
+    rankings 抓不到 → None。pid 不在 qualified pitching list → 「局數不足」。
+    BB 用 BB/9(walksPer9Inn)升冪排,符合「保送少 = 排前」直覺。"""
+    if not rankings or "pitching" not in rankings:
+        return None
+    try:
+        pid_int = int(pid)
+    except (ValueError, TypeError):
+        return None
+    pit = rankings["pitching"].get(pid_int)
+    if pit is None:
+        return "\U0001f4ca 聯盟排名(投):局數不足"
+    parts = []
+    for label, key in [("W", "w"), ("L", "l"), ("ERA", "era"),
+                       ("WHIP", "whip"), ("K", "k"), ("BB/9", "bb9")]:
+        rk = pit.get(key)
+        if rk is not None:
+            parts.append(f"{label} 第{rk}名")
+    if not parts:
+        return None
+    return "\U0001f4ca 聯盟排名(投):" + " / ".join(parts)
+
 def check_schedule(sport_id, prefix, label, state, players=None):
     if players is None:
         players = MLB_PLAYERS
@@ -831,8 +986,11 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         # Season 累積區塊:final 推播附本季數據(_get_season_stats 已 in-memory
                                         # cache,同 run 內同球員不重抓 API)。
                                         # League stats 給 OPS+ / ERA+ 算分母,抓不到就傳 None 跳過 plus 指標。
+                                        # Rankings 給「聯盟排名第 N 名」資訊,role 決定該球員顯示打/投 rank。
                                         season_full = _get_season_stats(pid_str)
                                         lg_stats = _get_mlb_league_stats()
+                                        rankings = _get_mlb_rankings()
+                                        role = season_full.get("role", "")
                                         sb_lines = []
                                         bblk = _fmt_season_block_batter(season_full.get("batting", {}), lg_stats)
                                         if bblk:
@@ -840,6 +998,22 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         pblk = _fmt_season_block_pitcher(season_full.get("pitching", {}), lg_stats)
                                         if pblk:
                                             sb_lines.append(pblk)
+                                        # Rank block:跟 season block 同步策略 — 純投手只投手 rank、
+                                        # 野手只打者 rank、Two-Way 兩個都插、空 role 兩個都嘗試
+                                        if role == "Pitcher":
+                                            show_bat_rank, show_pit_rank = False, True
+                                        elif role == "Two-Way Player" or role == "":
+                                            show_bat_rank, show_pit_rank = True, True
+                                        else:
+                                            show_bat_rank, show_pit_rank = True, False
+                                        if show_bat_rank:
+                                            rblk_b = _fmt_league_rank_block_batter(pid_str, rankings)
+                                            if rblk_b:
+                                                sb_lines.append(rblk_b)
+                                        if show_pit_rank:
+                                            rblk_p = _fmt_league_rank_block_pitcher(pid_str, rankings)
+                                            if rblk_p:
+                                                sb_lines.append(rblk_p)
                                         if sb_lines:
                                             stat_str = stat_str + "\n——\n" + "\n".join(sb_lines)
                                         if is_missed_live:
