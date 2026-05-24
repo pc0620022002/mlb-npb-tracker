@@ -1472,6 +1472,101 @@ def _fmt_npb_rank_block_pitcher(chinese_name, rankings):
         return None
     return "\U0001f4ca 聯盟排名(投):" + " / ".join(parts)
 
+# === 本季累積成績(球員個人頁,任何有一軍出賽的球員都有,不需 qualified)===
+# 2026-05-24:原本 NPB final 的本季數據綁在 _get_npb_rankings()(qualified 排行榜反查),
+# 林安可這類剛上一軍、打席不足的球員 not qualified → 整段 silent skip,user 看不到任何
+# 本季數據。改用 Yahoo 球員個人頁「年度別・通算」表的當季列(SSR、實測林安可打者 +
+# 宋家豪投手都完整),對齊 MLB「任何球員都查得到本季累積」。聯盟排名仍維持 qualified-only。
+_NPB_PLAYER_SEASON_CACHE = {}
+
+def _get_npb_player_id(stats_html, search_patterns):
+    """從 game stats 頁的球員連結 /npb/player/{id}/ 抓 Yahoo player id。抓不到回 None。"""
+    for pat in search_patterns:
+        idx = stats_html.find(pat)
+        if idx >= 0:
+            m = re.search(r'/npb/player/(\d+)/', stats_html[max(0, idx - 200):idx])
+            if m:
+                return m.group(1)
+    return None
+
+def _npb_year_row(html, title):
+    """從球員頁「年度別・通算の打者/投手成績」表抓當季那列的數值 list
+    (含開頭 年度 / チーム名 兩欄)。沒有當季列(今季尚無一軍紀錄)→ None。"""
+    ti = html.find(title)
+    if ti < 0:
+        return None
+    cur_year = str(datetime.now(timezone.utc).year)
+    seg = html[ti:ti + 30000]
+    for r in re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', seg):
+        vals = [v.strip() for v in re.findall(
+            r'<td[^>]*>(?:\s*<[^>]+>)*\s*([^<>]*?)\s*(?:</[^>]+>\s*)*</td>', r) if v.strip()]
+        if vals and vals[0] == cur_year:
+            return vals
+    return None
+
+def _get_npb_player_season(player_id):
+    """抓 Yahoo 球員個人頁本季累積成績,回 {'batting': [...], 'pitching': [...]}(raw 欄位 list)。
+    來源 /npb/player/{id}/top 的「年度別・通算」表當季列。抓不到回 {}。同 run 內 cache。"""
+    if not player_id:
+        return {}
+    if player_id in _NPB_PLAYER_SEASON_CACHE:
+        return _NPB_PLAYER_SEASON_CACHE[player_id]
+    out = {}
+    h = _fetch_yahoo(f"https://baseball.yahoo.co.jp/npb/player/{player_id}/top")
+    if h:
+        bat = _npb_year_row(h, "年度別・通算の打者成績")
+        if bat:
+            out["batting"] = bat
+        pit = _npb_year_row(h, "年度別・通算の投手成績")
+        if pit:
+            out["pitching"] = pit
+    _NPB_PLAYER_SEASON_CACHE[player_id] = out
+    return out
+
+def _fmt_npb_player_season_batter(vals):
+    """打者本季 block。vals = 年度別打者表當季列:
+    [0年度 1チーム 2打率 3試合 4打席 5打数 6安打 7二塁打 8三塁打 9本塁打 10塁打 11打点
+     12得点 13三振 14四球 15死球 16犠打 17犠飛 18盗塁 19盗塁死 20併殺打 21出塁率 22長打率 23OPS ...]"""
+    if not vals or len(vals) < 24:
+        return None
+    avg, games, hr, rbi, sb, obp, ops = vals[2], vals[3], vals[9], vals[11], vals[18], vals[21], vals[23]
+    parts = [f"{games}試合"]
+    if avg and avg != "-":
+        parts.append(f"打率{avg}")
+    if hr and hr != "0":
+        parts.append(f"{hr}HR")
+    if rbi and rbi != "0":
+        parts.append(f"{rbi}打點")
+    if sb and sb != "0":
+        parts.append(f"{sb}盜")
+    if obp and obp not in ("-", ".---"):
+        parts.append(f"OBP {obp}")
+    if ops and ops not in ("-", ".---"):
+        parts.append(f"OPS {ops}")
+    return "\U0001f4c8 本季打擊:" + " / ".join(parts)
+
+def _fmt_npb_player_season_pitcher(vals):
+    """投手本季 block。vals = 年度別投手表當季列:
+    [0年度 1チーム 2防御率 3登板 4先発 5完投 6完封 7無四球 8交代完了 9勝利 10敗戦
+     11ホールド 12HP 13セーブ 14勝率 15投球回 16打者 17被安打 18被本塁打 19奪三振 ...]"""
+    if not vals or len(vals) < 20:
+        return None
+    era, games, w, l, hold, sv, ip, k = vals[2], vals[3], vals[9], vals[10], vals[11], vals[13], vals[15], vals[19]
+    parts = [f"{games}登板"]
+    if era and era not in ("-", "-.--"):
+        parts.append(f"防御率{era}")
+    if w is not None and l is not None:
+        parts.append(f"{w}勝{l}敗")
+    if sv and sv != "0":
+        parts.append(f"{sv}S")
+    if hold and hold != "0":
+        parts.append(f"{hold}H")
+    if ip and ip != "-":
+        parts.append(f"{ip}局")
+    if k and k != "0":
+        parts.append(f"{k}奪三振")
+    return "\U0001f4c8 本季投球:" + " / ".join(parts)
+
 def _check_npb_league(state, league, league_label):
     """Check NPB games (1軍 or 2軍) for Taiwanese player lineups and appearances"""
     notifs = []
@@ -1718,15 +1813,19 @@ def _check_npb_league(state, league, league_label):
                         # 用 bat_stats / pit_stats 判斷該球員本場身分,對應加 batter/pitcher block;
                         # 不在 NPB qualified list → silent skip(NPB 名單多為二/三軍/育成,
                         # 大多數不會 qualified,顯式提示「打數不足」會 noisy)
+                        # 本季數據改用球員個人頁年度別表(任何有一軍出賽都有,不需 qualified);
+                        # 聯盟排名仍維持 qualified-only(沒達標就沒排名,合理)
+                        player_id = _get_npb_player_id(stats_html, pinfo["search"])
+                        season = _get_npb_player_season(player_id)
                         npb_rankings = _get_npb_rankings()
                         sb_lines = []
                         if bat_stats:
-                            bblk = _fmt_npb_season_block_batter(player_name, npb_rankings)
+                            bblk = _fmt_npb_player_season_batter(season.get("batting"))
                             if bblk: sb_lines.append(bblk)
                             rblk = _fmt_npb_rank_block_batter(player_name, npb_rankings)
                             if rblk: sb_lines.append(rblk)
                         if pit_stats:
-                            pblk = _fmt_npb_season_block_pitcher(player_name, npb_rankings)
+                            pblk = _fmt_npb_player_season_pitcher(season.get("pitching"))
                             if pblk: sb_lines.append(pblk)
                             rpblk = _fmt_npb_rank_block_pitcher(player_name, npb_rankings)
                             if rpblk: sb_lines.append(rpblk)
