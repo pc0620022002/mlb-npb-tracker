@@ -1050,20 +1050,36 @@ def _fetch_yahoo(url, timeout=(5, 8)):
     return None
 
 def _extract_npb_batting(html, search_patterns):
-    """Extract batting stats for a player from Yahoo Japan stats HTML"""
+    """Extract batting stats for a player from Yahoo Japan stats HTML.
+    打擊表欄位順序(實測 2026-05-24 game 2021038907):
+      打率 打数 得点 安打 打点 三振 四球 死球 犠打 盗塁 失策 本塁打(共 12 純數值欄)。
+    取前 8 欄(到死球)。四球在第 7 欄、死球在第 8 欄 —— 純四球/觸身打席「打数=0」,
+    且得点/安打/打点/三振也全 0,只有四球(或死球)=1。舊版只讀前 6 欄會把這種打席當成
+    「還沒上場」漏掉即時推播,要等下一個產生打数的打席才一起補(2026-05-24 林安可
+    四球→空三振「一次出現兩個打席」教訓)。故必須讀到第 7/8 欄並納入「已上場」判定
+    (對齊 MLB 的 baseOnBalls / hitByPitch 判定)。"""
     for pattern in search_patterns:
         escaped = re.escape(pattern)
-        # Match: name link -> batting avg -> at_bats -> runs -> hits -> rbi -> strikeouts
-        # Yahoo Japan HTML has whitespace between </a> and </td>
-        bat_re = escaped + r'</a>\s*</td>\s*<td[^>]*>([.\d-]+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>\s*<td[^>]*>(\d+)</td>'
+        # 名字 </a></td> 後接 8 個 stat cell:打率(可含小數/-)+ 打数得点安打打点三振四球死球(整數)
+        bat_re = (escaped + r'</a>\s*</td>\s*<td[^>]*>([.\d-]+)</td>'
+                  + r'\s*<td[^>]*>(\d+)</td>' * 7)
         m = re.search(bat_re, html, re.DOTALL)
         if m:
-            avg, ab, runs, hits, rbi, so = m.groups()
+            avg, ab, runs, hits, rbi, so, bb, hbp = m.groups()
             if int(ab) > 0:
-                return f"\U0001f3cf {ab}打數{hits}安打 {runs}得分 {rbi}打點 {so}三振 (打率{avg})"
-            elif int(runs) > 0 or int(hits) > 0 or int(rbi) > 0 or int(so) > 0:
-                # 0 AB but has other non-zero stats → actually appeared (walk/HBP)
-                return "\U0001f3cf 0打數 (四球/觸身上壘)"
+                line = f"\U0001f3cf {ab}打數{hits}安打 {runs}得分 {rbi}打點 {so}三振"
+                walk_bits = []
+                if int(bb) > 0: walk_bits.append(f"{bb}四球")
+                if int(hbp) > 0: walk_bits.append(f"{hbp}死球")
+                if walk_bits: line += " " + " ".join(walk_bits)
+                return line + f" (打率{avg})"
+            elif int(runs) > 0 or int(hits) > 0 or int(rbi) > 0 or int(so) > 0 or int(bb) > 0 or int(hbp) > 0:
+                # 0 打數但有四球/死球/得分等 → 已實際上場打擊(四球/觸身上壘也是一次出場)
+                walk_bits = []
+                if int(bb) > 0: walk_bits.append(f"{bb}四球")
+                if int(hbp) > 0: walk_bits.append(f"{hbp}死球")
+                desc = " ".join(walk_bits) if walk_bits else "四球/觸身上壘"
+                return f"\U0001f3cf 0打數 ({desc})"
             # else: all stats are zero → player listed in lineup but hasn't batted yet
     return ""
 
@@ -1085,7 +1101,12 @@ def _extract_npb_pitching(html, search_patterns):
     Columns after name: 防御率 投球回 投球数 打者 被安打 被本塁打 奪三振 与四球 与死球 ボーク 失点 自責点
     Returns a detailed stat line with IP, runs, ER, K, BB, hits, HR, and season ERA.
     """
-    _v = r'<td[^>]*>\s*(?:<p[^>]*>)?\s*([.\d-]+)\s*(?:</p>)?\s*</td>'
+    # 錨定投手表 cell:class 含 bb-scoreTable__data 且值包在 <p class="bb-scoreTable__dataLabel">。
+    # 不可用通配 <td>:打擊表的 12 個數值欄(class bb-statsTable__data,值直接在 td、無 <p>)
+    # 結構同樣是「名字 </a></td> + 12 個純數值 cell」,通配會把打者列整列誤匹配成投手列
+    # → 回出假 ERA / 假投球數據(2026-05-24 林安可被誤判為投手教訓)。投手表的值一律包在
+    # <p class="bb-scoreTable__dataLabel">,打擊表沒有這層 → 用它當區分錨點。
+    _v = r'<td[^>]*bb-scoreTable__data[^>]*>\s*<p[^>]*bb-scoreTable__dataLabel[^>]*>\s*([.\d-]+)\s*</p>\s*</td>'
     for pattern in search_patterns:
         escaped = re.escape(pattern)
         pit_re = escaped + r'</a>\s*</td>\s*' + r'\s*'.join([_v] * 12)
@@ -1615,6 +1636,12 @@ def _check_npb_league(state, league, league_label):
             # Extract actual stats (empty if all-zero pre-populated rows or absent)
             bat_stats = _extract_npb_batting(stats_html, pinfo["search"])
             pit_stats = _extract_npb_pitching(stats_html, pinfo["search"])
+            # 每打席結果先抓,兼作「已上場」兜底:_extract_npb_batting 的逐欄判定(打数/四球/
+            # 死球)仍可能漏某種打数=0 的打席(如犠牲打)。只要完成過任一打席就算上場 → 用
+            # at_bats 非空一網打盡,不靠逐欄列舉(2026-05-24 audit:四球修完順手補犠打盲點)。
+            ab_results = _extract_npb_at_bats(stats_html, pinfo["search"])
+            if not bat_stats and not pit_stats and ab_results:
+                bat_stats = "\U0001f3cf 0打數 (已上場)"
             stat_line = bat_stats or pit_stats or ""
 
             if stat_line:
@@ -1625,7 +1652,7 @@ def _check_npb_league(state, league, league_label):
                 # For batters, append per-AB results extracted from the same page
                 full_stat = stat_line
                 if bat_stats:
-                    ab_results = _extract_npb_at_bats(stats_html, pinfo["search"])
+                    # ab_results 已在迴圈頂端抓過,直接重用(省一次 regex)
                     if ab_results:
                         # Yahoo Japan 只在 cell 標 boolean「該打席有打點」,沒提供具體數字。
                         # 用「總 RBI + 有打點打席數」推算每打席打點數。
