@@ -928,7 +928,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                             inning_suffix = ""
                                         stat_str = "\n".join(lines) if lines else "已進入比賽"
                                         tag = "賽中更新" if prev_snap else "賽中出場"
-                                        notifs.append(f"\u26be <b>[{label} {tag}]</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> 已上場！\n{stat_str}")
+                                        notifs.append(f"\u26be <b>[{label} {tag}]</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> {'已上場！' if not prev_snap else '本場最新成績'}\n{stat_str}")
                                         state[live_key] = current_snap
 
                                 # --- First appearance for games already Final (no live updates sent) ---
@@ -1685,7 +1685,7 @@ def _check_npb_league(state, league, league_label):
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
                             msg += f"\U0001f4ca {aw_n} {aw_s} - {hm_s} {hm_n}\n"
-                        msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) 已上場！\n"
+                        msg += f"\U0001f464 <b>{player_name}</b> ({pinfo['team']}) {'已上場！' if not prev_snap else '本場最新成績'}\n"
                         msg += f"{full_stat}\n"
                         msg += f"\U0001f517 https://baseball.yahoo.co.jp/npb/game/{game_id}/stats"
                         notifs.append(msg)
