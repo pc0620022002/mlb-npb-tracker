@@ -342,30 +342,53 @@ _EVENT_TW = {
 def _translate_event(event):
     return _EVENT_TW.get(event, event)
 
-def _get_mlb_at_bats(gp, pid):
-    """Fetch per-at-bat results for a player via playByPlay. Returns list of (event_zh, rbi) tuples."""
+def _get_mlb_player_pbp(gp, pid):
+    """從 playByPlay 抓該球員資料。回 (ab_list, last_inning):
+      ab_list:    完成打席的 [(event_zh, rbi), ...](僅打者;給每打席列 + race 對齊檢查)
+      last_inning: (inning:int, is_top:bool) — 該球員「最近一次出場」(打者完成打席 或
+                   投手面對打者,取時序最後者)所在的局;抓不到回 None。
+
+    為何要回 last_inning:賽中推播的局數要顯示「這個事件發生在第幾局」,而不是「比賽當下
+    打到第幾局」。polling 間隔 5 分鐘,球員 8 局下打完後,下一輪 poll 時比賽常已進入
+    9 局上 → 直接讀 linescore.currentInning 會把推播標成「9局上」,與球員實際打席落差
+    (2026-05-28 Hao-Yu Lee 8 局下最後打者卻顯示 9 局上)。改用打席自身所在局即無此落差。"""
     try:
         r = _robust_get(f"https://statsapi.mlb.com/api/v1/game/{gp}/playByPlay", timeout=12)
         if r is None or not r.ok:
-            return []
+            return [], None
         plays = r.json().get("allPlays", [])
         target = int(pid)
-        out = []
+        ab_list = []
+        last_inning = None
         for play in plays:
-            batter_id = play.get("matchup", {}).get("batter", {}).get("id")
-            if batter_id != target:
-                continue
-            # Only include completed plate appearances (has result.event).
+            about = play.get("about", {})
+            mu = play.get("matchup", {})
+            batter_id = mu.get("batter", {}).get("id")
+            pitcher_id = mu.get("pitcher", {}).get("id")
             result = play.get("result", {})
             event = result.get("event")
-            if not event:
-                continue
-            rbi = result.get("rbi", 0)
-            out.append((_translate_event(event), rbi))
-        return out
+            inn = about.get("inning")
+            if batter_id == target and event:
+                # Only include completed plate appearances (has result.event).
+                ab_list.append((_translate_event(event), result.get("rbi", 0)))
+                if inn is not None:
+                    last_inning = (inn, bool(about.get("isTopInning")))
+            elif pitcher_id == target and inn is not None:
+                # 投手:取最近一次面對打者的 play 當作目前/最後所在局
+                last_inning = (inn, bool(about.get("isTopInning")))
+        return ab_list, last_inning
     except Exception as e:
         log(f"PBP err {gp}/{pid}: {e}")
-        return []
+        return [], None
+
+def _zh_inning(inning, is_top):
+    """(inning:int, is_top:bool) → 中文局數「5局上」/「9局下」/「延長10局上」。
+    inning 為 None 回空字串(賽前 / 抓不到)。"""
+    if inning is None:
+        return ""
+    half = "上" if is_top else "下"
+    prefix = "延長" if inning > 9 else ""
+    return f"{prefix}{inning}局{half}"
 
 def _fmt_at_bats(ab_list):
     """Format a list of AB results as numbered lines. Each item is (event, rbi) tuple."""
@@ -891,7 +914,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         # 不保證原子一致 — boxscore.atBats 偶爾會比 playByPlay 的 result.event 填寫
                                         # 早一拍,造成「N 打數但每打席只列 N-1 個」的不對齊推播。發現就 defer
                                         # 到下一輪 polling(state[live_key] 不更新 → 下輪 snap 仍 differs → 重檢查)。
-                                        ab_list = _get_mlb_at_bats(gp, pid_str) if has_bat else []
+                                        ab_list, last_inn = _get_mlb_player_pbp(gp, pid_str)
                                         if has_bat and ab > 0 and len(ab_list) < ab:
                                             log(f"  DEFER live push for {m}: boxscore ab={ab} but pbp has {len(ab_list)} completed events (race)")
                                             continue
@@ -916,16 +939,16 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                             if pl:
                                                 lines.append(pl)
                                         score_line = f"{away} {aws} - {hs} {home}"
-                                        # 賽中推播加當下第幾局(從 schedule hydrate 拿到的 linescore)
-                                        _ls = g.get("linescore") or {}
-                                        _inn = _ls.get("currentInning")
-                                        _half = _ls.get("inningHalf", "")
-                                        if _inn is not None:
-                                            _half_zh = "上" if _half == "Top" else ("下" if _half == "Bottom" else "")
-                                            _prefix = "延長" if _inn > 9 else ""
-                                            inning_suffix = f" {_prefix}{_inn}局{_half_zh}".rstrip()
+                                        # 賽中推播加局數:優先用「該球員最近一次出場所在局」(playByPlay),
+                                        # 比 linescore.currentInning 準 —— polling 落後時比賽當下局數會超前
+                                        # 球員實際打席(2026-05-28 案)。playByPlay 抓不到才 fall back linescore。
+                                        if last_inn:
+                                            inning_str = _zh_inning(last_inn[0], last_inn[1])
                                         else:
-                                            inning_suffix = ""
+                                            _ls = g.get("linescore") or {}
+                                            _inn = _ls.get("currentInning")
+                                            inning_str = _zh_inning(_inn, _ls.get("inningHalf") == "Top") if _inn is not None else ""
+                                        inning_suffix = f" {inning_str}" if inning_str else ""
                                         stat_str = "\n".join(lines) if lines else "已進入比賽"
                                         tag = "賽中更新" if prev_snap else "賽中出場"
                                         notifs.append(f"\u26be <b>[{label} {tag}]</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> {'已上場！' if not prev_snap else '本場最新成績'}\n{stat_str}")
@@ -948,7 +971,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         # 使用者偏好「晚一點推沒關係,但內容要對」→ final 也無限 defer 直到對齊,
                                         # 不設 cap。極端 MLB API 永久不對齊場景 user 會整場沒收到 final,但比起
                                         # 推不對齊資料(讓 user 誤以為球員只打 N-1 個打席)更可接受。
-                                        ab_list = _get_mlb_at_bats(gp, pid_str) if has_bat else []
+                                        ab_list = _get_mlb_player_pbp(gp, pid_str)[0] if has_bat else []
                                         if has_bat and ab > 0 and len(ab_list) < ab:
                                             log(f"  DEFER final push for {m}: boxscore ab={ab} but pbp has {len(ab_list)} (race, 無 cap 等到對齊)")
                                             continue
@@ -1130,7 +1153,9 @@ def _extract_npb_at_bats(html, search_patterns):
     打點打席會額外加上 class bb-statsTable__dataDetail--point。
     延長賽會在 inning 欄位右側增加新 cell(10/11/12 局),所以不能寫死「最後 9 cells」,
     一律取 stat cells 之後的所有 cells。
-    Returns a list of (result_str, has_point: bool) tuples in order.
+    Returns a list of (result_str, has_point: bool, inning: int) tuples in order。
+    inning 由該 cell 在 inning 欄位中的位置推得(第 1 個 inning cell = 1 局,以此類推),
+    用於賽中推播顯示「打席發生在第幾局」而非「比賽當下第幾局」。
     """
     for pattern in search_patterns:
         escaped = re.escape(pattern)
@@ -1146,12 +1171,12 @@ def _extract_npb_at_bats(html, search_patterns):
         inning_html = m.group(1)
         inning_cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', inning_html)
         results = []
-        for cell in inning_cells:
+        for idx, cell in enumerate(inning_cells):
             m = re.search(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell)
             if m:
                 classes, text = m.group(1), m.group(2).strip()
                 has_point = "--point" in classes
-                results.append((text, has_point))
+                results.append((text, has_point, idx + 1))  # cell 順序 = 局序,idx+1 = 第幾局
         if results:
             return results
     return []
@@ -1224,6 +1249,23 @@ def _extract_npb_inning(top_html):
     half = "上" if m.group(2) == "表" else "下"
     prefix = "延長" if n > 9 else ""
     return f"{prefix}{n}局{half}"
+
+def _npb_player_half(pinfo, score_info):
+    """判斷追蹤球員本場是客隊(表→上)或主隊(裏→下),回 '上'/'下';判斷不出回 ''。
+    score_info = (away_name, away_score, home_name, home_score)。用短隊名(pinfo['team'])
+    對 Yahoo 隊名雙向 substring 比對,比不到回空(suffix 只顯示局數、不顯示上/下,
+    仍比「比賽當下局數」準)。打者所有打席都在同半局(客打表 / 主打裏),只需判一次。"""
+    if not score_info:
+        return ""
+    away_name, _, home_name, _ = score_info
+    team = pinfo.get("team", "")
+    if not team:
+        return ""
+    if team in away_name or away_name in team:
+        return "上"
+    if team in home_name or home_name in team:
+        return "下"
+    return ""
 
 # NPB qualified player rankings cache(對齊 MLB 的 final 推播附本季 stats + 聯盟排名)。
 # 來源:npb.jp 官方 2026 season stats 四張表(セ・パ × 打/投),SSR 靜態頁。
@@ -1752,9 +1794,9 @@ def _check_npb_league(state, league, league_label):
                         # Yahoo Japan 只在 cell 標 boolean「該打席有打點」,沒提供具體數字。
                         # 用「總 RBI + 有打點打席數」推算每打席打點數。
                         rbi_total = _extract_npb_rbi_total(stats_html, pinfo["search"])
-                        point_count = sum(1 for _, has_pt in ab_results if has_pt)
+                        point_count = sum(1 for _, has_pt, _inn in ab_results if has_pt)
                         ab_lines = []
-                        for i, (ev, has_pt) in enumerate(ab_results):
+                        for i, (ev, has_pt, _inn) in enumerate(ab_results):
                             if has_pt and rbi_total > 0:
                                 if point_count == 1:
                                     suffix = f" ({rbi_total}打點)"
@@ -1775,7 +1817,18 @@ def _check_npb_league(state, league, league_label):
                     prev_snap = state.get(live_key)
                     if prev_snap != full_stat:
                         tag = "賽中更新" if prev_snap else "賽中出場"
-                        inning_suffix = f" {inning_str}" if inning_str else ""
+                        # \u5c40\u6578:\u6253\u8005\u512a\u5148\u7528\u300c\u6700\u5f8c\u4e00\u500b\u6253\u5e2d\u6240\u5728\u5c40\u300d(\u6253\u5e2d\u5217 cell \u4f4d\u7f6e=\u5c40\u5e8f),
+                        # \u6bd4 top.html \u7684\u6bd4\u8cfd\u7576\u4e0b\u5c40\u6578\u6e96 \u2014\u2014 polling \u843d\u5f8c\u6642\u7403\u54e1\u6253\u5b8c\u4e00\u5c40\u3001\u6bd4\u8cfd\u5df2
+                        # \u9032\u4e0b\u4e00\u5c40,\u76f4\u63a5\u7528\u7576\u4e0b\u5c40\u6578\u6703\u591a\u986f\u793a\u4e00\u5c40(\u5c0d\u9f4a MLB \u6539\u6cd5,2026-05-28)\u3002
+                        # \u6295\u624b / \u6293\u4e0d\u5230\u6253\u5e2d \u2192 fall back \u6bd4\u8cfd\u7576\u4e0b\u5c40\u6578(inning_str)\u3002
+                        if bat_stats and ab_results:
+                            _n = ab_results[-1][2]
+                            _half = _npb_player_half(pinfo, score_info)
+                            _pfx = "\u5ef6\u9577" if _n > 9 else ""
+                            inning_show = f"{_pfx}{_n}\u5c40{_half}"
+                        else:
+                            inning_show = inning_str
+                        inning_suffix = f" {inning_show}" if inning_show else ""
                         msg = f"\u26be <b>[NPB {league_label} {tag}]</b>{inning_suffix}\n"
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
