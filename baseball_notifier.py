@@ -1565,13 +1565,100 @@ def _get_npb_player_season(player_id):
     _NPB_PLAYER_SEASON_CACHE[player_id] = out
     return out
 
-def _fmt_npb_player_season_batter(vals):
+# === 本場 box score 即時數據(用來把「賽前個人頁累積」補成「本場後本季」)===
+# 2026-05-31:徐若熙賽後推播的「本季投球」停在賽前(7.23 防御率 / 4登板 / 1勝3敗 / 18.2局),
+# 沒含本場。Trace:Yahoo 球員個人頁「年度別・通算」表當天不即時更新(隔天才回填),
+# 但比賽 box score 頁(/stats)的本季防御率 / 打率是即時的(賽後就更新)。
+# 修法:用「賽前個人頁累積 + 本場 box score 數據」合成本場後本季,而非直接信會延遲的年度別表。
+# 比率值(打率 / 防御率)用 box score 即時本季值;計數值(登板 / 勝敗 / 局數 / 奪三振 / HR /
+# 打點 / 盜)用賽前 + 本場相加;OBP / OPS 用更新後原始數重算。同全域 CLAUDE.md 2026-05-24
+# 教訓「用會延遲的歷史源查剛發生的事件」家族。
+
+def _npb_ip_add(a, b):
+    """NPB 投球回相加。格式「X.Y」其中 Y∈{0,1,2} 代表幾分之三局(18.2 = 18又2/3)。
+    回合成後的「X.Y」(Y=0 時仍回「X.0」對齊年度別表格式)。"""
+    def to_outs(s):
+        s = (s or "").strip()
+        if not s or s == "-":
+            return 0
+        if "." in s:
+            whole, frac = s.split(".", 1)
+            return int(whole) * 3 + int(frac[0])
+        return int(s) * 3
+    total = to_outs(a) + to_outs(b)
+    return f"{total // 3}.{total % 3}"
+
+def _extract_npb_pitching_raw(html, search_patterns):
+    """抓本場投手 box score 原始值 + 勝敗註記(用於合成本場後本季)。
+    回 {era(本季), ip(本場), k(本場), status(勝/敗/S/H)} 或 None。"""
+    _v = r'<td[^>]*bb-scoreTable__data[^>]*>\s*<p[^>]*bb-scoreTable__dataLabel[^>]*>\s*([.\d-]+)\s*</p>\s*</td>'
+    for pattern in search_patterns:
+        escaped = re.escape(pattern)
+        pit_re = escaped + r'</a>\s*</td>\s*' + r'\s*'.join([_v] * 12)
+        m = re.search(pit_re, html, re.DOTALL)
+        if m:
+            era, ip, pitches, batters, bh, bhr, k, bb, hbp, balk, runs, er = m.groups()
+            if ip in ("0", "0.0"):
+                return None
+            # 状態 cell(勝/敗/S/H)在球員名字 cell 之前,取最靠近名字的那個
+            pre = html[max(0, m.start() - 300):m.start()]
+            sm = re.findall(r'--state[^>]*>\s*([^<]*?)\s*</td>', pre)
+            status = sm[-1].strip() if sm else ""
+            return {"era": era, "ip": ip, "k": k, "status": status}
+    return None
+
+def _extract_npb_batting_raw(html, search_patterns):
+    """抓本場打者 box score 原始值(12 欄全讀)。
+    回 {avg(本季), ab, hits, rbi, bb, hbp, sb, hr} 或 None。"""
+    for pattern in search_patterns:
+        escaped = re.escape(pattern)
+        # 打率(float)+ 打数 得点 安打 打点 三振 四球 死球 犠打 盗塁 失策 本塁打(11 整數)
+        bat_re = (escaped + r'</a>\s*</td>\s*<td[^>]*>([.\d-]+)</td>'
+                  + r'\s*<td[^>]*>(\d+)</td>' * 11)
+        m = re.search(bat_re, html, re.DOTALL)
+        if m:
+            avg, ab, runs, hits, rbi, so, bb, hbp, sac, sb, err, hr = m.groups()
+            return {"avg": avg, "ab": int(ab), "hits": int(hits), "rbi": int(rbi),
+                    "bb": int(bb), "hbp": int(hbp), "sb": int(sb), "hr": int(hr)}
+    return None
+
+def _fmt_npb_player_season_batter(vals, game=None, game_tb=None):
     """打者本季 block。vals = 年度別打者表當季列:
     [0年度 1チーム 2打率 3試合 4打席 5打数 6安打 7二塁打 8三塁打 9本塁打 10塁打 11打点
      12得点 13三振 14四球 15死球 16犠打 17犠飛 18盗塁 19盗塁死 20併殺打 21出塁率 22長打率 23OPS ...]"""
     if not vals or len(vals) < 24:
         return None
     avg, games, hr, rbi, sb, obp, ops = vals[2], vals[3], vals[9], vals[11], vals[18], vals[21], vals[23]
+    if game:
+        # 年度別表當天不即時更新 → 用「賽前累積 + 本場 box score」合成本場後本季。
+        # 比率(打率)用 box score 即時本季值;計數值相加;OBP/OPS 用更新後原始數重算。
+        # game_tb = 本場壘打數(由每打席結果推得,抓不到時 caller 傳 None,退化成「非全壘打安打皆一壘打」)。
+        try:
+            if game.get("avg") not in (None, "", "-", ".---"):
+                avg = game["avg"]
+            games = str(int(games) + 1)
+            hr = str(int(hr) + game.get("hr", 0))
+            rbi = str(int(rbi) + game.get("rbi", 0))
+            sb = str(int(sb) + game.get("sb", 0))
+            # OBP 重算:(安打+四球+死球)/(打数+四球+死球+犠飛),本場犠飛≈0(box score 未單列)
+            s_ab, s_h, s_tb = int(vals[5]), int(vals[6]), int(vals[10])
+            s_bb, s_hbp, s_sf = int(vals[14]), int(vals[15]), int(vals[17])
+            n_ab = s_ab + game.get("ab", 0)
+            n_h = s_h + game.get("hits", 0)
+            n_bb = s_bb + game.get("bb", 0)
+            n_hbp = s_hbp + game.get("hbp", 0)
+            ob = n_h + n_bb + n_hbp
+            den_obp = n_ab + n_bb + n_hbp + s_sf
+            obp_val = ob / den_obp if den_obp > 0 else None
+            if obp_val is not None:
+                obp = f"{obp_val:.3f}".lstrip("0")
+            # SLG / OPS:本場壘打數有 game_tb 用之,否則退化成 hits + 3*HR(非全壘打安打皆當一壘打)
+            tb_game = game_tb if game_tb is not None else (game.get("hits", 0) + 3 * game.get("hr", 0))
+            n_tb = s_tb + tb_game
+            if n_ab > 0 and obp_val is not None:
+                ops = f"{obp_val + n_tb / n_ab:.3f}".lstrip("0")
+        except (ValueError, ZeroDivisionError, TypeError):
+            pass  # 任一欄解析失敗 → 退回賽前年度別值(寧可略舊不要崩)
     parts = [f"{games}試合"]
     if avg and avg != "-":
         parts.append(f"打率{avg}")
@@ -1587,13 +1674,29 @@ def _fmt_npb_player_season_batter(vals):
         parts.append(f"OPS {ops}")
     return "\U0001f4c8 本季打擊:" + " / ".join(parts)
 
-def _fmt_npb_player_season_pitcher(vals):
+def _fmt_npb_player_season_pitcher(vals, game=None):
     """投手本季 block。vals = 年度別投手表當季列:
     [0年度 1チーム 2防御率 3登板 4先発 5完投 6完封 7無四球 8交代完了 9勝利 10敗戦
-     11ホールド 12HP 13セーブ 14勝率 15投球回 16打者 17被安打 18被本塁打 19奪三振 ...]"""
+     11ホールド 12HP 13セーブ 14勝率 15投球回 16打者 17被安打 18被本塁打 19奪三振 ...]
+    game = 本場 box score raw(_extract_npb_pitching_raw),傳入時把賽前累積補成本場後本季。"""
     if not vals or len(vals) < 20:
         return None
     era, games, w, l, hold, sv, ip, k = vals[2], vals[3], vals[9], vals[10], vals[11], vals[13], vals[15], vals[19]
+    if game:
+        # 年度別表當天不即時更新 → 防御率用 box score 即時本季值,計數值用賽前 + 本場相加。
+        try:
+            if game.get("era") not in (None, "", "-", "-.--"):
+                era = game["era"]
+            games = str(int(games) + 1)
+            st = game.get("status", "")
+            w = str(int(w) + (1 if "勝" in st else 0))
+            l = str(int(l) + (1 if ("敗" in st or "負" in st) else 0))
+            sv = str(int(sv) + (1 if ("S" in st or "Ｓ" in st) else 0))
+            hold = str(int(hold) + (1 if ("H" in st or "Ｈ" in st) else 0))
+            ip = _npb_ip_add(ip, game.get("ip", "0"))
+            k = str(int(k) + int(game.get("k", 0)))
+        except (ValueError, TypeError):
+            pass  # 任一欄解析失敗 → 退回賽前年度別值
     parts = [f"{games}登板"]
     if era and era not in ("-", "-.--"):
         parts.append(f"防御率{era}")
@@ -1873,12 +1976,24 @@ def _check_npb_league(state, league, league_label):
                         npb_rankings = _get_npb_rankings()
                         sb_lines = []
                         if bat_stats:
-                            bblk = _fmt_npb_player_season_batter(season.get("batting"))
+                            # 年度別表當天不即時更新 → 帶入本場 box score 把本季補到「本場後」
+                            game_bat = _extract_npb_batting_raw(stats_html, pinfo["search"])
+                            # 本場壘打數:用每打席結果推得(本=4 / 含3=3 / 含2=2 / 含安=1),抓不到傳 None
+                            game_tb = None
+                            if ab_results:
+                                game_tb = 0
+                                for _ev, _hp, _inn in ab_results:
+                                    if "本" in _ev: game_tb += 4
+                                    elif "3" in _ev: game_tb += 3
+                                    elif "2" in _ev: game_tb += 2
+                                    elif "安" in _ev: game_tb += 1
+                            bblk = _fmt_npb_player_season_batter(season.get("batting"), game_bat, game_tb)
                             if bblk: sb_lines.append(bblk)
                             rblk = _fmt_npb_rank_block_batter(player_name, npb_rankings)
                             if rblk: sb_lines.append(rblk)
                         if pit_stats:
-                            pblk = _fmt_npb_player_season_pitcher(season.get("pitching"))
+                            game_pit = _extract_npb_pitching_raw(stats_html, pinfo["search"])
+                            pblk = _fmt_npb_player_season_pitcher(season.get("pitching"), game_pit)
                             if pblk: sb_lines.append(pblk)
                             rpblk = _fmt_npb_rank_block_pitcher(player_name, npb_rankings)
                             if rpblk: sb_lines.append(rpblk)
