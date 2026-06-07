@@ -1911,11 +1911,16 @@ def _check_npb_league(state, league, league_label):
             if stat_line:
                 # Player has actual non-zero stats — mid-game or final
                 players_found_total += 1
-                log(f"    FOUND with stats: {player_name} in game {game_id} -> {stat_line}")
+                log(f"    FOUND with stats: {player_name} in game {game_id} -> bat={bool(bat_stats)} pit={bool(pit_stats)}")
 
-                # For batters, append per-AB results extracted from the same page
-                full_stat = stat_line
+                # full_stat 同時涵蓋打擊與投球。2026-06-07:原本 `stat_line = bat_stats or
+                # pit_stats` 在球員同場既打擊又投球時(如 セ・リーグ 無 DH 投手要打擊,徐若熙)
+                # 只取打擊、投球被 or 吃掉 → 賽中/賽後只剩打擊更新。改成兩段都帶,投球變動也
+                # 觸發 live 重推(full_stat 是 snapshot dedup 值)。
+                stat_parts = []
                 if bat_stats:
+                    bat_body = bat_stats
+                    # For batters, append per-AB results extracted from the same page
                     # ab_results 已在迴圈頂端抓過,直接重用(省一次 regex)
                     if ab_results:
                         # Yahoo Japan 只在 cell 標 boolean「該打席有打點」,沒提供具體數字。
@@ -1934,7 +1939,11 @@ def _check_npb_league(state, league, league_label):
                             else:
                                 suffix = ""
                             ab_lines.append(f"  {i+1}. {ev}{suffix}")
-                        full_stat = f"{stat_line}\n\U0001f4dd 每打席：\n" + "\n".join(ab_lines)
+                        bat_body = f"{bat_stats}\n\U0001f4dd 每打席：\n" + "\n".join(ab_lines)
+                    stat_parts.append(bat_body)
+                if pit_stats:
+                    stat_parts.append(pit_stats)
+                full_stat = "\n".join(stat_parts)
 
                 if not is_finished:
                     # --- MID-GAME: live update whenever stat line changes ---
