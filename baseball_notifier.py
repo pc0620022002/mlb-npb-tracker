@@ -574,8 +574,9 @@ def _get_mlb_league_stats():
         _MLB_LEAGUE_STATS_CACHE = False
         return None
 
-def _get_season_stats(pid):
+def _get_season_stats(pid, sport_id=1):
     """Fetch current season stats + primaryPosition via 合併 hydrate endpoint(一次 API call)。
+    sport_id: 1=MLB(預設)、11=3A。同一球員本季可能在兩級都有出賽,需各級分別抓。
     根據球員「本主位置」過濾:
       - 純投手(primaryPosition.type='Pitcher')→ 只保留 pitching group,清空 batting
       - 兩用打者(type='Two-Way Player',目前只有 Ohtani)→ 兩個 group 都保留
@@ -584,7 +585,7 @@ def _get_season_stats(pid):
     紀錄,推播也只顯示主身分,避免單一球員推 2 條本季區塊困惑 user。
     Returns dict: {"batting": {...}, "pitching": {...}, "avg": str|None, "era": str|None, "role": str}
     """
-    cache_key = str(pid)
+    cache_key = f"{pid}_{sport_id}"
     if cache_key in _SEASON_STATS_CACHE:
         return _SEASON_STATS_CACHE[cache_key]
     result = {"batting": {}, "pitching": {}, "avg": None, "era": None, "role": ""}
@@ -592,7 +593,7 @@ def _get_season_stats(pid):
         year = date.today().year
         r = _robust_get(
             f"https://statsapi.mlb.com/api/v1/people/{pid}",
-            params={"hydrate": f"stats(group=[hitting,pitching],type=season,season={year})"},
+            params={"hydrate": f"stats(group=[hitting,pitching],type=season,sportId={sport_id},season={year})"},
             timeout=10)
         if r and r.ok:
             ppl = r.json().get("people", [{}])[0]
@@ -643,6 +644,20 @@ def _get_season_stats(pid):
         log(f"Season stats err {pid}: {e}")
     _SEASON_STATS_CACHE[cache_key] = result
     return result
+
+# 2026-06-07:球員本季可能同時在 MLB + 3A 都有出賽紀錄(如 Hao-Yu Lee 在兩級間升降),
+# 賽後「本季數據」原本只抓 MLB(sportId 預設 1)→ 在 3A 比賽賽後卻顯示 MLB 本季,誤導。
+# 改成逐級抓「本季真的有出賽」的層級,final 推播兩級都附上。
+_SEASON_LEVELS = [(1, "MLB"), (11, "3A")]
+def _get_season_stats_all_levels(pid):
+    """回 [(level_label, stats_dict), ...],只含本季真的有出賽紀錄的層級(MLB 在前)。
+    stats_dict 形式同 _get_season_stats。兩級都無資料則回空 list。"""
+    out = []
+    for sid, lbl in _SEASON_LEVELS:
+        st = _get_season_stats(pid, sid)
+        if st.get("batting") or st.get("pitching"):
+            out.append((lbl, st))
+    return out
 
 def _fmt_pitcher_line(pit, season_era=None):
     """Detailed pitcher stat line: IP R/ER K BB H HR (ERA)."""
@@ -698,9 +713,10 @@ def _safe_float(v):
     except (ValueError, TypeError):
         return None
 
-def _fmt_season_block_batter(b, lg=None):
+def _fmt_season_block_batter(b, lg=None, label_suffix=""):
     """產出本季打擊累積區塊。輸入 b 是 _get_season_stats()['batting'] 形式 dict。
     lg 是 _get_mlb_league_stats() 回的 dict(用來算 OPS+);傳 None 就略過 OPS+。
+    label_suffix:顯示在「本季打擊」後的層級標記(如「(3A)」),球員跨級時用來區分。
     無任何欄位可顯示則回 None。"""
     if not b:
         return None
@@ -727,11 +743,12 @@ def _fmt_season_block_batter(b, lg=None):
             parts.append(f"OPS+ {ops_plus}")
     if not parts:
         return None
-    return "\U0001f4c8 本季打擊:" + " / ".join(parts)
+    return "\U0001f4c8 本季打擊" + label_suffix + ":" + " / ".join(parts)
 
-def _fmt_season_block_pitcher(p, lg=None):
+def _fmt_season_block_pitcher(p, lg=None, label_suffix=""):
     """產出本季投球累積區塊。輸入 p 是 _get_season_stats()['pitching'] 形式 dict。
     lg 是 _get_mlb_league_stats() 回的 dict(用來算 ERA+);傳 None 就略過 ERA+。
+    label_suffix:顯示在「本季投球」後的層級標記(如「(3A)」),球員跨級時用來區分。
     無任何欄位可顯示則回 None。"""
     if not p:
         return None
@@ -755,7 +772,7 @@ def _fmt_season_block_pitcher(p, lg=None):
             parts.append(f"ERA+ {era_plus}")
     if not parts:
         return None
-    return "\U0001f4c8 本季投球:" + " / ".join(parts)
+    return "\U0001f4c8 本季投球" + label_suffix + ":" + " / ".join(parts)
 
 def _fmt_league_rank_block_batter(pid, rankings):
     """產出打者「📊 聯盟排名(打)」一行。
@@ -924,7 +941,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         season_era = pv.get("seasonStats", {}).get("pitching", {}).get("era")
                                         if (has_bat and (not season_avg or season_avg in ("-", ".---"))) or \
                                            (has_pit and (not season_era or season_era in ("-", "-.--"))):
-                                            fb = _get_season_stats(pid_str)
+                                            fb = _get_season_stats(pid_str, sport_id)  # 用該場層級(MLB/3A)的本季 avg/era,不混級
                                             if not season_avg or season_avg in ("-", ".---"):
                                                 season_avg = fb.get("avg")
                                             if not season_era or season_era in ("-", "-.--"):
@@ -981,7 +998,7 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         season_era = pv.get("seasonStats", {}).get("pitching", {}).get("era")
                                         if (has_bat and (not season_avg or season_avg in ("-", ".---"))) or \
                                            (has_pit and (not season_era or season_era in ("-", "-.--"))):
-                                            fb = _get_season_stats(pid_str)
+                                            fb = _get_season_stats(pid_str, sport_id)  # 用該場層級(MLB/3A)的本季 avg/era,不混級
                                             if not season_avg or season_avg in ("-", ".---"):
                                                 season_avg = fb.get("avg")
                                             if not season_era or season_era in ("-", "-.--"):
@@ -1020,17 +1037,24 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         # cache,同 run 內同球員不重抓 API)。
                                         # League stats 給 OPS+ / ERA+ 算分母,抓不到就傳 None 跳過 plus 指標。
                                         # Rankings 給「聯盟排名第 N 名」資訊,role 決定該球員顯示打/投 rank。
-                                        season_full = _get_season_stats(pid_str)
+                                        # 2026-06-07:球員本季可能 MLB + 3A 都有出賽(跨級升降)→ 兩級都附,
+                                        # 各自標 (MLB)/(3A);只有一級有資料時不標,維持原樣。OPS+/ERA+ 的
+                                        # league 分母是 MLB 平均,只對 MLB 層級算(拿去比 3A 會失真)。
+                                        season_levels = _get_season_stats_all_levels(pid_str)
                                         lg_stats = _get_mlb_league_stats()
                                         rankings = _get_mlb_rankings()
-                                        role = season_full.get("role", "")
+                                        role = season_levels[0][1].get("role", "") if season_levels else ""
+                                        multi_level = len(season_levels) > 1
                                         sb_lines = []
-                                        bblk = _fmt_season_block_batter(season_full.get("batting", {}), lg_stats)
-                                        if bblk:
-                                            sb_lines.append(bblk)
-                                        pblk = _fmt_season_block_pitcher(season_full.get("pitching", {}), lg_stats)
-                                        if pblk:
-                                            sb_lines.append(pblk)
+                                        for lvl_lbl, lvl_st in season_levels:
+                                            suffix = f"({lvl_lbl})" if multi_level else ""
+                                            lg_for_level = lg_stats if lvl_lbl == "MLB" else None
+                                            bblk = _fmt_season_block_batter(lvl_st.get("batting", {}), lg_for_level, suffix)
+                                            if bblk:
+                                                sb_lines.append(bblk)
+                                            pblk = _fmt_season_block_pitcher(lvl_st.get("pitching", {}), lg_for_level, suffix)
+                                            if pblk:
+                                                sb_lines.append(pblk)
                                         # Rank block:跟 season block 同步策略 — 純投手只投手 rank、
                                         # 野手只打者 rank、Two-Way 兩個都插、空 role 兩個都嘗試
                                         if role == "Pitcher":
