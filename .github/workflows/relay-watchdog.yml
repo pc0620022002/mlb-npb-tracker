@@ -1,0 +1,79 @@
+name: Relay Watchdog
+
+# 為什麼需要這個獨立 watchdog:
+#
+# baseball.yml 的 `Notify Telegram + auto-trigger relay on workflow failure`(if: failure())
+# 跑在「同一個 job 的同一個 runner」上。當 GHA runner 本身暴斃(annotation: "The hosted
+# runner lost communication with the server")時,main step 跟 if:failure() handler
+# **共用同一個 runner**,runner 一死兩個一起死 → 不 auto-relay、不發 TG 警告、chain 默默斷掉。
+#
+# 這正是「多層保險共同前提掛了 → 集體失靈」:auto-relay handler 跟它要救的 main step
+# 共用「這個 runner 還活著」這個前提。runner 暴斃時前提崩 → 兩層保險一起失效。
+# (2026-06-09 tpstadium-bot 真實踩到同款 runner lost communication,故同步補這裡。)
+#
+# 這個 watchdog 由 `workflow_run` 事件觸發,跑在「全新的、獨立的 runner」上,不跟暴斃的
+# runner 共用任何前提。baseball.yml 一旦 conclusion == failure(含 runner 暴斃),這裡就會
+# 在新 runner 上 re-dispatch baseball.yml 接力 + 推 TG 警告。
+#
+# 安全性:
+# - 只在 conclusion == 'failure' 才 re-dispatch,不碰 'cancelled'(cancel-in-progress
+#   是 concurrency 正常行為,canceller 自己已經起了新 run → 避免 relay 風暴)。
+# - re-dispatch 後新 run 正常會以 success/cancelled 結束,不會再觸發本 watchdog → 不會無限迴圈。
+#   只有「持續性 crash」才會連續觸發,那本身就是該被吵醒的警報。
+# - re-dispatch 走 workflow_dispatch(GITHUB_TOKEN 對 workflow_dispatch 不受 recursion
+#   限制,跟 baseball.yml 自己的 self-trigger relay 同機制,已驗證可運作)。
+
+on:
+  workflow_run:
+    workflows: ["Baseball Notifier"]
+    types: [completed]
+
+permissions:
+  actions: write   # re-dispatch baseball.yml
+
+jobs:
+  relay-on-failure:
+    # 只接「真失敗」;cancelled(concurrency 正常行為)不碰
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - name: Re-dispatch baseball.yml + notify
+        run: |
+          echo "Watchdog 偵測到 baseball.yml 失敗(conclusion=failure),在獨立 runner 上接力..."
+
+          RELAY_OK=0
+          for i in 1 2 3; do
+            HTTP=$(curl -sS -o /tmp/relay.json -w "%{http_code}" -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GH_REPO}/actions/workflows/baseball.yml/dispatches" \
+              -d '{"ref":"main"}' || echo "curl_failed")
+            echo "Watchdog relay attempt $i: HTTP=${HTTP}"
+            if [ "$HTTP" = "204" ]; then
+              RELAY_OK=1
+              break
+            fi
+            cat /tmp/relay.json 2>/dev/null || true
+            [ "$i" -lt 3 ] && sleep 5
+          done
+
+          if [ "$RELAY_OK" = "1" ]; then
+            RELAY_NOTE="✅ Watchdog 已在獨立 runner 上接力觸發新 run,chain 已續上(原 run 的 runner 可能暴斃,if:failure() handler 跟著死)。"
+          else
+            RELAY_NOTE="❌ Watchdog re-dispatch 也失敗(3 次),等 cron fallback(最多 1h)接手。"
+          fi
+
+          MSG=$(printf '⚠️ mlb-npb-tracker:baseball.yml 失敗,Watchdog 介入\n失敗 run: %s\n%s' "${FAILED_RUN_URL}" "${RELAY_NOTE}")
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" >/dev/null || true
+
+          [ "$RELAY_OK" = "1" ]
