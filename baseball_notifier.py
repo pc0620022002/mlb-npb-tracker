@@ -1650,9 +1650,17 @@ def _fmt_npb_player_season_batter(vals, game=None, game_tb=None):
     """打者本季 block。vals = 年度別打者表當季列:
     [0年度 1チーム 2打率 3試合 4打席 5打数 6安打 7二塁打 8三塁打 9本塁打 10塁打 11打点
      12得点 13三振 14四球 15死球 16犠打 17犠飛 18盗塁 19盗塁死 20併殺打 21出塁率 22長打率 23OPS ...]"""
-    if not vals or len(vals) < 24:
+    # 2026-06-11:年度別表「沒有本季列」(球員本季首次一軍出賽 / 初出場)時,vals 為 None。
+    # 此時不能 return None(否則整段本季區塊消失,user 反映「賽後沒有本季統整」)。
+    # 「沒有本季列」⟺ 本季一軍零紀錄 ⟺ 本場是本季首次上場 → 用本場 box score 當「零基線 + 本場」,
+    # 即等於完整本季線(1試合)。只有連 box score 都沒有(game=None)才放棄。
+    has_year_row = bool(vals) and len(vals) >= 24
+    if not has_year_row and not game:
         return None
-    avg, games, hr, rbi, sb, obp, ops = vals[2], vals[3], vals[9], vals[11], vals[18], vals[21], vals[23]
+    if has_year_row:
+        avg, games, hr, rbi, sb, obp, ops = vals[2], vals[3], vals[9], vals[11], vals[18], vals[21], vals[23]
+    else:
+        avg, games, hr, rbi, sb, obp, ops = "-", "0", "0", "0", "0", "-", "-"
     if game:
         # 年度別表當天不即時更新 → 用「賽前累積 + 本場 box score」合成本場後本季。
         # 比率(打率)用 box score 即時本季值;計數值相加;OBP/OPS 用更新後原始數重算。
@@ -1664,9 +1672,10 @@ def _fmt_npb_player_season_batter(vals, game=None, game_tb=None):
             hr = str(int(hr) + game.get("hr", 0))
             rbi = str(int(rbi) + game.get("rbi", 0))
             sb = str(int(sb) + game.get("sb", 0))
-            # OBP 重算:(安打+四球+死球)/(打数+四球+死球+犠飛),本場犠飛≈0(box score 未單列)
-            s_ab, s_h, s_tb = int(vals[5]), int(vals[6]), int(vals[10])
-            s_bb, s_hbp, s_sf = int(vals[14]), int(vals[15]), int(vals[17])
+            # OBP 重算:(安打+四球+死球)/(打数+四球+死球+犠飛),本場犠飛≈0(box score 未單列)。
+            # 無年度別列時賽前累積全部當 0(本季首場)。
+            s_ab, s_h, s_tb = (int(vals[5]), int(vals[6]), int(vals[10])) if has_year_row else (0, 0, 0)
+            s_bb, s_hbp, s_sf = (int(vals[14]), int(vals[15]), int(vals[17])) if has_year_row else (0, 0, 0)
             n_ab = s_ab + game.get("ab", 0)
             n_h = s_h + game.get("hits", 0)
             n_bb = s_bb + game.get("bb", 0)
@@ -1703,9 +1712,15 @@ def _fmt_npb_player_season_pitcher(vals, game=None):
     [0年度 1チーム 2防御率 3登板 4先発 5完投 6完封 7無四球 8交代完了 9勝利 10敗戦
      11ホールド 12HP 13セーブ 14勝率 15投球回 16打者 17被安打 18被本塁打 19奪三振 ...]
     game = 本場 box score raw(_extract_npb_pitching_raw),傳入時把賽前累積補成本場後本季。"""
-    if not vals or len(vals) < 20:
+    # 2026-06-11:年度別表「沒有本季列」(球員本季首次一軍登板 / 初登板)時,vals 為 None。
+    # 此時用本場 box score 當「零基線 + 本場」=完整本季線(1登板),不要 return None 讓整段消失。
+    has_year_row = bool(vals) and len(vals) >= 20
+    if not has_year_row and not game:
         return None
-    era, games, w, l, hold, sv, ip, k = vals[2], vals[3], vals[9], vals[10], vals[11], vals[13], vals[15], vals[19]
+    if has_year_row:
+        era, games, w, l, hold, sv, ip, k = vals[2], vals[3], vals[9], vals[10], vals[11], vals[13], vals[15], vals[19]
+    else:
+        era, games, w, l, hold, sv, ip, k = "-", "0", "0", "0", "0", "0", "0", "0"
     if game:
         # 年度別表當天不即時更新 → 防御率用 box score 即時本季值,計數值用賽前 + 本場相加。
         try:
