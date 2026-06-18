@@ -843,8 +843,21 @@ def check_schedule(sport_id, prefix, label, state, players=None):
         except Exception as e:
             log(f"{label} API error for {check_date}: {e}")
 
+    seen_gp = set()
     for game_date_str, g in all_games_data:
             gp = g.get("gamePk", 0)
+            # 跨日 backstop(同時查 today + yesterday)下,suspended/resumed 或 gameDate 與
+            # officialDate 跨日的比賽,同一個 gamePk 會被兩個 check_date 都回傳(實測 824912
+            # Giants@Braves:officialDate 6/16、續賽落在 6/17 → date=6-16 與 date=6-17 都查到)。
+            # 若用「查詢日期」當 dedup key 的一部分,同一場會生出兩個 key → lineup/賽中/final
+            # 全部各推一次,內容完全相同的重複推播。修法:(a)dedup key 改用比賽自身 officialDate,
+            # 確保同一 gamePk 永遠同一個 key;(b)同輪同一 gamePk 只處理一次,順便省掉重複 boxscore
+            # fetch。NPB 跨日 backstop(commit a7483aa)早已改用 game_date + acceptable_dates 去重,
+            # MLB/3A 這條一直沿用 check_date 當 key、漏了同款保險,此處補齊。
+            if gp in seen_gp:
+                continue
+            seen_gp.add(gp)
+            game_date_str = g.get("officialDate") or game_date_str
             abst = g.get("status",{}).get("abstractGameState","")
             home = g.get("teams",{}).get("home",{}).get("team",{}).get("name","")
             away = g.get("teams",{}).get("away",{}).get("team",{}).get("name","")
