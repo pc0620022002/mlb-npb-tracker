@@ -2485,12 +2485,18 @@ def main():
     gap_s = int(now_ts - last_ok_ts) if last_ok_ts else 0
 
     # Gap 超過上輪預期間隔 3 倍 = 系統真的失聯,推一條警告讓使用者知道剛才有空白
+    # real_gap=True 時代表「restore 到的 state 已經 stale」(典型:runner 暴斃 lost
+    # communication → 未存檔的 dedup keys 全丟 → 恢復後 restore 到舊 state)。
+    # 這種情況「state 裡 last_ok_ts 之後的事件」很可能在暴斃前就推過了 → 若照常送會把
+    # 整段已推過的事件重洗一次(2026-06-25 事故的「現在才開始補推一堆」)。故 real_gap
+    # 一律比照 cold_start:只標 dedup、不回補推(下面 suppress_backfill)。
+    real_gap = False
     if last_ok_ts > 0 and gap_s > prev_expected_interval * 3:
         gap_min = gap_s // 60
         alert_msg = (
             f"\u26a0\ufe0f <b>[系統健檢]</b>\n"
             f"上次成功執行距現在 <b>{gap_min} 分鐘</b>,超過預期 {prev_expected_interval//60} 分鐘間隔。\n"
-            f"<i>這段時間可能漏推賽中事件,以下若有累積資料會在後續訊息送出。</i>\n"
+            f"<i>這段時間可能漏推賽中事件;為避免重複洗版,累積的舊事件只標記不重送,賽後 final 會以 [系統補推] 帶回。</i>\n"
             f"\U0001f50d 詳情看 GitHub Actions log"
         )
         # 發送前先用 GHA API 驗證:若上一個 run 是「最近被 concurrency 取消的健康 run」
@@ -2498,8 +2504,9 @@ def main():
         if _is_gap_cache_race_false_alarm():
             log(f"⚠️ Gap {gap_s}s > {prev_expected_interval*3}s,但驗證為 cache-race 假警報 → suppress")
         else:
+            real_gap = True
             _send_alert(alert_msg, state)
-            log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert")
+            log(f"⚠️ Gap {gap_s}s > {expected_interval*3}s, sent system-gap alert + 將 suppress 補推")
     elif last_ok_ts > 0:
         log(f"Last ok run {gap_s}s ago (prev_expected={prev_expected_interval}s, this_round_expected={expected_interval}s, teams_playing={teams_playing})")
     else:
@@ -2529,11 +2536,15 @@ def main():
     log(f"  -> {len(all_notifs)-n} NPB 1軍 notifications")
 
     sent = 0
-    if cold_start:
-        # state 為空(初次部署 / cache 遺失 / corrupt 救回) → 所有 dedup key 已寫進 state,
-        # 但訊息不送出。避免「補推今天所有舊事件」spam(user 過去因 cache miss 一次收 16+ 條的問題)
-        # 真正中段漏掉的事件靠 final 推播時的 "[系統補推]" 標籤抓回(那條會送)
-        log(f"COLD START: state was empty, suppressing {len(all_notifs)} backfill notif(s) (only marking dedup keys)")
+    # suppress_backfill:cold_start(state 為空)或 real_gap(restore 到 stale state,
+    # 典型 runner 暴斃)時,本輪所有累積事件只標 dedup 不送出,避免恢復瞬間洗版。
+    # 真正中段漏掉的事件靠 final 推播時的 "[系統補推]" 標籤抓回(那條會送)。
+    suppress_backfill = cold_start or real_gap
+    if suppress_backfill:
+        # 所有 dedup key 已寫進 state,但訊息不送出。避免「補推今天所有舊事件」spam
+        # (user 過去因 cache miss / runner 暴斃 一次收一堆已推過訊息的問題)
+        reason = "COLD START (state empty)" if cold_start else "REAL GAP (restored stale state，疑似 runner 暴斃)"
+        log(f"{reason}: suppressing {len(all_notifs)} backfill notif(s) (only marking dedup keys)")
         for msg in all_notifs:
             log(f"  suppressed: {msg[:60].replace(chr(10),' ')}...")
     else:
