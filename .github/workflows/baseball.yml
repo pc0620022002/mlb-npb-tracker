@@ -10,9 +10,9 @@ on:
     - cron: '17 */6 * * *'
   workflow_dispatch:
 
-# self-trigger relay 需要 actions:write;cache 用 default contents:read 即可
+# self-trigger relay 需要 actions:write;state-cache 分支每輪 push 需要 contents:write
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 # 新 run 觸發時取消舊 run(配合 save-always cache,確保 state 在 cancel 時也存到)
@@ -37,14 +37,33 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # state.json 跨 run 共享。用 restore + save 分開,save 放後面 always() 確保 cancel/timeout 也存
-      - name: Restore state cache
+      # state.json 跨 run 共享。
+      # 主來源:state-cache 分支(loop 內每輪 commit+push,runner 暴斃 lost-communication
+      #   時 actions/cache 的 always() save 不會跑,但每輪即時 push 的 state 已落地遠端
+      #   → 任何恢復 restore 到秒級最新 state,不會把暴斃前已推過的事件當新事件大量補推)。
+      # 備援:actions/cache(state-cache 分支還沒建立時的 migration fallback,first run 用)。
+      - name: Restore state cache (fallback)
         uses: actions/cache/restore@v4
         with:
           path: state.json
           key: baseball-state-${{ github.run_id }}
           restore-keys: |
             baseball-state-
+
+      - name: Restore state from state-cache branch (primary)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin state-cache 2>/dev/null; then
+            if git show FETCH_HEAD:state.json > /tmp/state.branch 2>/dev/null; then
+              mv /tmp/state.branch state.json
+              echo "Restored state.json from state-cache branch ($(wc -c < state.json) bytes)"
+            else
+              echo "state-cache 分支存在但無 state.json;沿用 actions/cache fallback"
+            fi
+          else
+            echo "尚無 state-cache 分支(首次遷移 run);沿用 actions/cache fallback"
+          fi
 
       # 不靠 GHA cron 接力(實測延遲 1-2 小時,造成空白 stall)。
       # 改在 run 內主動 self-trigger 接力 run:跑到剩 RELAY_LEAD_TIME 時呼叫 GHA API
@@ -102,6 +121,21 @@ jobs:
               fi
             fi
             POLL_INTERVAL=$(python3 -c "import json,sys; sys.stdout.write(str(json.load(open('state.json')).get('_next_poll_interval', $DEFAULT_INTERVAL)))" 2>/dev/null || echo $DEFAULT_INTERVAL)
+
+            # ⭐ ② 每輪把最新 state push 到 state-cache 分支:
+            #    runner 暴斃(lost communication)時 actions/cache 的 always() save 不會跑,
+            #    但每輪即時 push 的 state 已落地遠端 → 任何恢復都 restore 到秒級最新 state,
+            #    不會把暴斃前已推過的事件當新事件大量補推(2026-06-25 事故根治)。
+            #    state.json 在 main 是 gitignore,用 -f 強制納入;force-push 到專用 state-cache
+            #    分支(機器用,不 merge 回 main)。push 失敗不影響主流程(actions/cache 兜底)。
+            if [ -f state.json ]; then
+              git add -f state.json 2>/dev/null || true
+              if ! git diff --cached --quiet 2>/dev/null; then
+                git commit -q -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ) run ${GITHUB_RUN_ID}" 2>/dev/null || true
+                git push -q -f origin HEAD:state-cache 2>/dev/null || echo "[WARN] state-cache push 失敗(non-fatal,actions/cache 兜底)"
+              fi
+            fi
+
             ELAPSED=$(( $(date +%s) - START ))
             SLEEP=$(( POLL_INTERVAL - ELAPSED ))
             REMAINING=$(( END - $(date +%s) ))
@@ -153,8 +187,11 @@ jobs:
           done
           echo "Loop finished after ${ITERATION} iterations (relay_triggered=${RELAY_TRIGGERED})"
 
-      # 不論 success / failure / cancel,都把最新 state 存回 cache
-      - name: Save state cache
+      # 次要備援:不論 success / failure / cancel,都把最新 state 存回 actions/cache。
+      # 主持久層已改成 loop 內每輪 push 的 state-cache 分支(見上);這層只在
+      # 「正常結束 / 被 concurrency cancel」時補存一份,runner 暴斃時這步不會跑(預期內,
+      # 暴斃前最後一輪的 state-cache 分支 push 已是最新)。
+      - name: Save state cache (secondary)
         if: ${{ always() }}
         uses: actions/cache/save@v4
         with:
