@@ -981,7 +981,9 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                         inning_suffix = f" {inning_str}" if inning_str else ""
                                         stat_str = "\n".join(lines) if lines else "已進入比賽"
                                         tag = "賽中更新" if prev_snap else "賽中出場"
-                                        notifs.append(f"\u26be <b>[{label} {tag}]</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> {'已上場！' if not prev_snap else '本場最新成績'}\n{stat_str}")
+                                        # 球員名放第一行:同場多位追蹤球員各推一則時,標題+比分開頭相同,
+                                        # 手機通知預覽只顯示前幾行 → 看起來像連續重複訊息(2026-07-08 user 回報)
+                                        notifs.append(f"\u26be <b>[{label} {tag}]</b> <b>{m}</b>{inning_suffix}\n\U0001f4ca {score_line}\n\U0001f464 <b>{m}</b> {'已上場！' if not prev_snap else '本場最新成績'}\n{stat_str}")
                                         state[live_key] = current_snap
 
                                 # --- First appearance for games already Final (no live updates sent) ---
@@ -1086,12 +1088,13 @@ def check_schedule(sport_id, prefix, label, state, players=None):
                                                 sb_lines.append(rblk_p)
                                         if sb_lines:
                                             stat_str = stat_str + "\n——\n" + "\n".join(sb_lines)
+                                        # 球員名放第一行(同上:通知預覽區分同場多位球員)
                                         if is_missed_live:
-                                            header = (f"\u26a0\ufe0f <b>[{label} 比賽結果 — 系統補推]</b>\n"
+                                            header = (f"\u26a0\ufe0f <b>[{label} 比賽結果 — 系統補推]</b> <b>{m}</b>\n"
                                                       f"<i>此球員從未在 live 階段被推播,中段過程可能因系統空白漏掉</i>\n"
                                                       f"\u26be 完整本場紀錄:")
                                         else:
-                                            header = f"\u26be <b>[{label} 比賽結果]</b>"
+                                            header = f"\u26be <b>[{label} 比賽結果]</b> <b>{m}</b>"
                                         notifs.append(f"{header}\n\U0001f4ca {away} <b>{aws}</b> - <b>{hs}</b> {home}\n\U0001f464 <b>{m}</b>：\n{stat_str}")
                                         state[final_key] = True
                 except Exception as e:
@@ -1993,7 +1996,8 @@ def _check_npb_league(state, league, league_label):
                         else:
                             inning_show = inning_str
                         inning_suffix = f" {inning_show}" if inning_show else ""
-                        msg = f"\u26be <b>[NPB {league_label} {tag}]</b>{inning_suffix}\n"
+                        # 球員名放第一行(同上:通知預覽區分同場多位球員)
+                        msg = f"\u26be <b>[NPB {league_label} {tag}]</b> <b>{player_name}</b>{inning_suffix}\n"
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
                             msg += f"\U0001f4ca {aw_n} {aw_s} - {hm_s} {hm_n}\n"
@@ -2015,12 +2019,13 @@ def _check_npb_league(state, league, league_label):
                     if is_missed_live:
                         state[live_key] = "final_only"
                     if final_key not in state:
+                        # 球員名放第一行(同上:通知預覽區分同場多位球員)
                         if is_missed_live:
-                            msg = (f"\u26a0\ufe0f <b>[NPB {league_label} 比賽結果 — 系統補推]</b>\n"
+                            msg = (f"\u26a0\ufe0f <b>[NPB {league_label} 比賽結果 — 系統補推]</b> <b>{player_name}</b>\n"
                                    f"<i>此球員從未在 live 階段被推播,中段過程可能因系統空白漏掉</i>\n"
                                    f"\U0001f4ca 完整本場紀錄:\n")
                         else:
-                            msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b>\n"
+                            msg = f"\U0001f4ca <b>[NPB {league_label} 比賽結果]</b> <b>{player_name}</b>\n"
                         if score_info:
                             aw_n, aw_s, hm_n, hm_s = score_info
                             msg += f"\U0001f4ca {aw_n} <b>{aw_s}</b> - <b>{hm_s}</b> {hm_n}\n"
