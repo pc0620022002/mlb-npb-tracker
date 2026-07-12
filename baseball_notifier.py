@@ -1183,6 +1183,37 @@ def _extract_npb_pitching(html, search_patterns):
                 return line
     return ""
 
+def _attribute_npb_rbi(ab_results, rbi_total, known):
+    """跨輪增量歸因:推算每個「有打點打席」的具體打點數。
+    Yahoo stats 頁只在打席 cell 標 boolean「有打點」,不給數字;但 polling 每 5 分鐘
+    跑一輪,常態下一輪只會新增一個有打點打席 → 用「總打點的增量」歸因給新打席。
+    ab_results: _extract_npb_at_bats 的輸出 [(結果, has_point, 局), ...]
+    known: 上一輪的歸因 {打席index(str): 打點數}(存 state,JSON key 為字串)
+    回傳新的 known。分不出來的打席不寫入(顯示端 fallback「(有打點)」)。
+    (2026-07-12 林安可雙響教訓:舊邏輯只認「單一有打點打席」或「打席數=總打點」
+    兩種型,2轟3打點兩者皆非 → 每打席全部退化成「(有打點)」)"""
+    if rbi_total <= 0:
+        return known
+    point_idxs = [i for i, (_ev, pt, _inn) in enumerate(ab_results) if pt]
+    # 記錄更正防護:已不再標「有打點」的打席,丟掉舊歸因
+    known = {k: v for k, v in known.items() if int(k) in point_idxs}
+    unassigned = [i for i in point_idxs if str(i) not in known]
+    remaining = rbi_total - sum(known.values())
+    if remaining < 0:
+        # 總打點被下修(Yahoo 記錄更正)→ 既有歸因作廢重算
+        known = {}
+        unassigned = point_idxs
+        remaining = rbi_total
+    if unassigned and remaining >= len(unassigned):
+        if len(unassigned) == 1:
+            known[str(unassigned[0])] = remaining
+        elif remaining == len(unassigned):
+            for i in unassigned:
+                known[str(i)] = 1
+        # else: 同輪出現多個新的有打點打席且無法均分(cold start / state 遺失)
+        #       → 不硬猜,留給顯示端「(有打點)」fallback
+    return known
+
 def _extract_npb_at_bats(html, search_patterns):
     """Extract per-inning at-bat results for a batter from Yahoo Japan stats HTML.
     Each batter row has 12 stat cells + N inning cells (N=9 normally, more for 延長戦),
@@ -1212,8 +1243,11 @@ def _extract_npb_at_bats(html, search_patterns):
         inning_cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', inning_html)
         results = []
         for idx, cell in enumerate(inning_cells):
-            m = re.search(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell)
-            if m:
+            # 同一局 cell 可能有多個結果 div(打者一巡、單局兩打席)→ finditer 全收,
+            # 不能只取第一個(否則第二打席整個消失)。比賽時序是順向的,新打席只會
+            # 出現在「目前最後一個非空 cell」之後 → 攤平後的打席 index 跨輪穩定遞增,
+            # 打點歸因用 index 當 key 不會錯位。
+            for m in re.finditer(r'<div class="(bb-statsTable__dataDetail[^"]*)">([^<]+)</div>', cell):
                 classes, text = m.group(1), m.group(2).strip()
                 has_point = "--point" in classes
                 results.append((text, has_point, idx + 1))  # cell 順序 = 局序,idx+1 = 第幾局
@@ -1955,16 +1989,20 @@ def _check_npb_league(state, league, league_label):
                     # ab_results 已在迴圈頂端抓過,直接重用(省一次 regex)
                     if ab_results:
                         # Yahoo Japan 只在 cell 標 boolean「該打席有打點」,沒提供具體數字。
-                        # 用「總 RBI + 有打點打席數」推算每打席打點數。
+                        # 用 _attribute_npb_rbi 跨輪增量歸因出每打席打點數,結果存
+                        # state[abrbi_key](key 帶 game_date,save_state 7 天清理自動涵蓋),
+                        # live / final 推播共用同一份歸因。
                         rbi_total = _extract_npb_rbi_total(stats_html, pinfo["search"])
-                        point_count = sum(1 for _, has_pt, _inn in ab_results if has_pt)
+                        abrbi_key = f"npb_{game_date}_abrbi_{game_id}_{player_name}"
+                        prev_known = dict(state.get(abrbi_key) or {})
+                        known = _attribute_npb_rbi(ab_results, rbi_total, prev_known)
+                        if known != prev_known:
+                            state[abrbi_key] = known
                         ab_lines = []
                         for i, (ev, has_pt, _inn) in enumerate(ab_results):
                             if has_pt and rbi_total > 0:
-                                if point_count == 1:
-                                    suffix = f" ({rbi_total}打點)"
-                                elif point_count == rbi_total:
-                                    suffix = " (1打點)"
+                                if str(i) in known:
+                                    suffix = f" ({known[str(i)]}打點)"
                                 else:
                                     suffix = " (有打點)"
                             else:
@@ -2462,6 +2500,18 @@ def main():
             del state[bad_final_key]
             log(f"One-off correction: removed {bad_final_key} → NPB iteration will re-push corrected final")
         state["_correction_lin_extra_inning"] = True
+        save_state(state)
+
+    # 2026-07-12 一次性 seed:林安可單場雙響(日本ハム vs 西武,game 2021039130)。
+    # 每打席打點跨輪歸因(_attribute_npb_rbi)上線時該場已有 2 個有打點打席,cold start
+    # 分不出 2+1;但兩轟打點數已從當日 live 推播增量確認(第一轟時總打點 2、第二轟後 3)
+    # → 直接 seed 歸因,讓 final 推播帶正確數字。abrbi key 7 天後由 save_state 自動清。
+    if not state.get("_seed_lin_20260712_abrbi"):
+        _seed_key = "npb_2026-07-12_abrbi_2021039130_林安可"
+        if _seed_key not in state:
+            state[_seed_key] = {"0": 2, "1": 1}
+            log(f"One-off seed: {_seed_key} = 2+1 打點歸因")
+        state["_seed_lin_20260712_abrbi"] = True
         save_state(state)
 
     # 自動偵測亞洲球員(每天跑一次,結果寫進 state["_dynamic_players"])
