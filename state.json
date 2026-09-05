@@ -25,8 +25,8 @@
   },
   "_last_discovery_ts": 1788555160.243,
   "_last_run_ts": 1777422860.325515,
-  "_last_ok_ts": 1788633021.372315,
-  "_next_poll_interval": 600,
+  "_last_ok_ts": 1788633618.644931,
+  "_next_poll_interval": 120,
   "_hardcoded_team_overrides": {
     "678225": 158
   },
