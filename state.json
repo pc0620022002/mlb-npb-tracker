@@ -1,0 +1,68 @@
+{
+  "_npb_fix_v2": true,
+  "_npb_fix_v3": true,
+  "_dynamic_players": {
+    "800018": {
+      "name": "Chen Zhong-Ao Zhuang",
+      "org": 133,
+      "origin": "tw"
+    },
+    "807747": {
+      "name": "Rikuu Nishida",
+      "org": 145,
+      "origin": "jp"
+    },
+    "827734": {
+      "name": "Wei-En Lin",
+      "org": 133,
+      "origin": "tw"
+    },
+    "808970": {
+      "name": "Woo-Suk Go",
+      "org": 142,
+      "origin": "kr"
+    }
+  },
+  "_last_discovery_ts": 1792189957.957414,
+  "_last_run_ts": 1777422860.325515,
+  "_last_ok_ts": 1792261970.446447,
+  "_next_poll_interval": 600,
+  "_hardcoded_team_overrides": {
+    "678225": 158
+  },
+  "_last_hardcoded_refresh_ts": 1792242254.13675,
+  "_heartbeat_last_date": "2026-10-17",
+  "_correction_lin_extra_inning": true,
+  "_npb_budget_bail_alert_ts_first": 1778426155.176452,
+  "_npb_zero_games_alert_ts_first": 1778462755.664998,
+  "_pending_send": [],
+  "_seed_lin_20260712_abrbi": true,
+  "npb_2026-10-10_live_2021039477_孫易磊": "⚾ 1局 0失分(0自責) 2K 0BB 0被安 0HR (ERA 0.00)",
+  "npb_2026-10-10_final_2021039477_孫易磊": true,
+  "mlb_2026-10-10_lineup_849831_808959": true,
+  "mlb_2026-10-10_live_849831_808959": "B:4-0-0-0-0-4",
+  "mlb_2026-10-10_final_849831_808959": true,
+  "mlb_2026-10-11_lineup_849809_660271": true,
+  "mlb_2026-10-11_live_849809_660271": "B:3-1-0-0-1-1",
+  "mlb_2026-10-12_pitcher_849812_808967": true,
+  "mlb_2026-10-11_final_849809_660271": true,
+  "npb_2026-10-12_live_2021039479_孫易磊": "⚾ 2局 0失分(0自責) 4K 1BB 1被安 0HR (ERA 0.00)",
+  "npb_2026-10-12_final_2021039479_孫易磊": true,
+  "mlb_2026-10-12_lineup_849812_660271": true,
+  "mlb_2026-10-12_live_849812_660271": "B:4-0-0-0-0-2",
+  "mlb_2026-10-12_live_849812_808967": "P:2.2-3-3-1-2-4-0",
+  "mlb_2026-10-12_live_849812_808963": "P:1.0-0-0-1-1-0-0",
+  "mlb_2026-10-12_final_849812_660271": true,
+  "mlb_2026-10-12_final_849812_808963": true,
+  "mlb_2026-10-12_final_849812_808967": true,
+  "mlb_2026-10-14_lineup_849811_660271": true,
+  "mlb_2026-10-14_live_849811_660271": "B:2-1-0-0-1-0",
+  "mlb_2026-10-14_live_849811_808963": "P:0.1-1-1-0-0-2-0",
+  "mlb_2026-10-14_final_849811_660271": true,
+  "mlb_2026-10-14_final_849811_808963": true,
+  "mlb_2026-10-15_lineup_849810_660271": true,
+  "mlb_2026-10-15_live_849810_660271": "B:4-1-1-3-0-3",
+  "mlb_2026-10-15_final_849810_660271": true,
+  "npb_2026-10-16_live_2021039488_孫易磊": "⚾ 0.1局 2失分(2自責) 0K 1BB 1被安 0HR (ERA 54.00)",
+  "npb_2026-10-16_final_2021039488_孫易磊": true
+}
